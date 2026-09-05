@@ -674,6 +674,11 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
         }
         break;
+    case SpeculativeBackend::DFlash2:
+        if (options.speculative.draft_tokens != 7) {
+            throw std::invalid_argument("DFlash2 requires draft_tokens=7");
+        }
+        throw std::invalid_argument("DFlash2 execution is not implemented");
     }
     if (options.tp != 1 && options.tp != 2) {
         throw std::invalid_argument("tensor-parallel width must be 1 or 2");
