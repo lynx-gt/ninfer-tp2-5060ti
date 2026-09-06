@@ -76,7 +76,7 @@ load, graph construction, and warmup do not enter topology counts.
 For a DFlash2 companion artifact:
 
 ```bash
-./build/bench/ninfer_bench --weights out/qwen3_8_27b_nvfp4.ninfer \
+./build/bench/ninfer_bench --weights out/qwen3_8_27b_nvfp4_dflash2.ninfer \
   -pg '2048,128' --spec dflash2 --draft-tokens 7 --lm-head-draft \
   --max-ctx 4096 --kv-dtype bf16 --warmup 1 -r 3
 ```

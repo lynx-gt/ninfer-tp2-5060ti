@@ -7,6 +7,10 @@
 
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/candidate_selector.h"
+#include "ninfer/ops/context_kv_materialize.h"
+#include "ninfer/ops/dynamic_grouped_conv.h"
+#include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
@@ -215,8 +219,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .output_rows    = TextConfig::output_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
-                                         .enable_mtp     = plan.features.mtp(),
-                                         .enable_dflash  = plan.features.dflash()});
+                                         .backend        = plan.speculative_backend});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
@@ -525,14 +528,24 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.dflash()) {
+    if (plan.features.masked_draft()) {
         if constexpr (!Variant::supports_dflash) {
             throw std::logic_error("unsupported target reached DFlash scratch planning");
         } else {
-            const auto dflash_context_capacity = [&](std::int32_t tokens, bool compact_input) {
+            const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
+                                                     bool compact_input) {
+                const auto tokens = width * batch;
                 WorkspaceLayoutBuilder layout;
                 if (compact_input) {
                     matrix(layout, DType::BF16, DFlashConfig::feature_rows, tokens);
+                }
+                if constexpr (DFlashConfig::coherent_selector) {
+                    const auto local_width = std::min(width, DFlashConfig::local_capacity);
+                    (void)workspace_recipe::dflash_context<DFlashConfig>(layout,
+                                                                         local_width * batch);
+                    scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
+                                        batch, local_width, local_width));
+                    return finish(layout);
                 }
                 (void)workspace_recipe::dflash_context<DFlashConfig>(layout, tokens);
                 {
@@ -545,6 +558,60 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
+                if constexpr (DFlashConfig::coherent_selector) {
+                    const auto prepare = [&] {
+                        (void)workspace_recipe::dflash2_branch<DFlashConfig>(layout, width, batch);
+                        scratch(layout,
+                                ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                                    width, width, batch, batch));
+                    };
+                    {
+                        auto attention = layout.scope();
+                        prepare();
+                        matrix(layout, DType::BF16, DFlashConfig::query_size, tokens);
+                        matrix(layout, DType::BF16, DFlashConfig::kv_size, tokens);
+                        matrix(layout, DType::BF16, DFlashConfig::kv_size, tokens);
+                        matrix(layout, DType::BF16, DFlashConfig::query_size, tokens);
+                        scratch(layout, ops::sliding_window_attention_workspace_capacity_bytes(
+                                            {DFlashConfig::head_dim, DFlashConfig::query_heads,
+                                             DFlashConfig::kv_heads},
+                                            DFlashConfig::local_capacity, {0, plan.capacity}, width,
+                                            width, batch));
+                        scratch(layout,
+                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                    DFlashConfig::query_size, width, width, batch, batch));
+                    }
+                    {
+                        auto mlp = layout.scope();
+                        prepare();
+                        matrix(layout, DType::BF16, DFlashConfig::intermediate, tokens);
+                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                            DFlashConfig::hidden, tokens, tokens));
+                        scratch(layout,
+                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                    DFlashConfig::intermediate, width, width, batch, batch));
+                    }
+                    const auto mask_columns = drafts * batch;
+                    matrix(layout, DType::BF16, DFlashConfig::hidden, mask_columns);
+                    matrix(layout, DType::FP32, 16, mask_columns);
+                    if (plan.proposal_head == ProposalHead::Optimized) {
+                        scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                            QType::Q4G64_F16S, Variant::draft_head_rows,
+                                            DFlashConfig::hidden, mask_columns, mask_columns));
+                    } else {
+                        // The registered full heads are W8 and FP8; both use the same public input.
+                        for (const auto qtype : {QType::W8G32_F16S, QType::FP8_E4M3FN_ROW_BF16S}) {
+                            scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                                qtype, TextConfig::output_rows,
+                                                DFlashConfig::hidden, mask_columns, mask_columns));
+                        }
+                    }
+                    matrix(layout, DType::BF16, 256, mask_columns);
+                    scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
+                                        drafts, drafts, batch, batch));
+                    return finish(layout);
+                }
                 {
                     auto attention = layout.scope();
                     (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
@@ -577,7 +644,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 return finish(layout);
             };
 
-            out.dflash_context = dflash_context_capacity(chunk, false);
+            out.dflash_context = dflash_context_capacity(chunk, 1, false);
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
                 const std::int32_t aggregate = verify * batch;
@@ -586,11 +653,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =
-                    ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                        TextConfig::token_domain, drafts, drafts, batch, batch);
+                    DFlashConfig::coherent_selector
+                        ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                              TextConfig::token_domain, {false}, drafts, drafts, batch, batch)
+                        : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                              TextConfig::token_domain, drafts, drafts, batch, batch);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
-                out.dflash_round           = std::max({out.dflash_round, finish(target), accept,
-                                                       dflash_context_capacity(aggregate, true), proposal});
+                out.dflash_round =
+                    std::max({out.dflash_round, finish(target), accept,
+                              dflash_context_capacity(verify, batch, true), proposal});
             }
         }
     }
@@ -663,22 +734,18 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         }
         break;
     case SpeculativeBackend::DFlash:
-        if (kMaximumDFlashDraftTokens == 0) {
-            throw std::invalid_argument("DFlash is not supported by this target");
+    case SpeculativeBackend::DFlash2:
+        if (options.speculative.backend != DFlashConfig::backend) {
+            throw std::invalid_argument(
+                "selected masked draft backend is not supported by this target");
         }
-        if (options.speculative.draft_tokens == 0 ||
-            options.speculative.draft_tokens > kMaximumDFlashDraftTokens) {
-            throw std::invalid_argument("DFlash draft window must be in [1,15]");
+        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
+            throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         if (options.enable_vision) {
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
         }
         break;
-    case SpeculativeBackend::DFlash2:
-        if (options.speculative.draft_tokens != 7) {
-            throw std::invalid_argument("DFlash2 requires draft_tokens=7");
-        }
-        throw std::invalid_argument("DFlash2 execution is not implemented");
     }
     if (options.tp != 1 && options.tp != 2) {
         throw std::invalid_argument("tensor-parallel width must be 1 or 2");

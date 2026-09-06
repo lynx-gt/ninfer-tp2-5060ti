@@ -15,8 +15,6 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `ops/linear_add/`, `ops/linear_pair/`, `ops/linear_swiglu/` — fused-Op suites split by registered
   weight/activation profile, each evaluating its complete formula rather than composing production
   Ops;
-- `ops/test_allreduce.cpp` — the two-device `allreduce_sum`/`allgather_rows` collectives; it needs
-  two CUDA devices visible to one process and reports the shared skip code when fewer are present;
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
@@ -33,7 +31,6 @@ benchmark-report, and external protocol behavior. Repository verification princi
   `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,
   schema-guided tool-argument normalization, structural fallback, and chunk-invariant incremental
   tool-call behavior;
-- `test_materialization_budget.cpp` — deterministic planning-budget and shared admission-boundary behavior;
 - `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
   representative Serve request/throughput pretty records, failure severity, zero-field elision,
   and exclusion of arbitrary client error text;
@@ -207,21 +204,17 @@ broad additions without a concrete regression risk do not belong in the permanen
 The real test uses one explicit companion artifact and compares a fixed greedy fixture and its
 penalty-count variant with ordinary decoding. It also checks compact batches with unequal output
 budgets, same-seed stochastic replay, retained/fresh prefix behavior, and absence of a full backend
-KV pool. A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page
-boundary, stops after one target column at token 64, and checks the exact retained frontier and
-subsequent generation with and without reuse.
-The KV Store test checks exact mapping and reservation accounting for the same transition.
-K>=7 also exercises a stop inside a licensed block; K=15 additionally checks oversized prefill,
+KV pool. K>=7 exercises a stop inside a licensed block; K=15 additionally checks oversized prefill,
 local ring wrap, and the logical context-capacity tail. Optional Vision runs image/video capture
 and prefix restore. Zero extra Device StateImage slots exercise Host snapshot/restore.
 
 ```bash
 cmake --build build -j --target ninfer_qwen3_8_27b_dflash2_real_test
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b.ninfer \
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_dflash2.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test 15 1 1 8
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b.ninfer \
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_dflash2.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test 7 1 0 2 bf16 1 0
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_nvfp4.ninfer \
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test 2 0 0 2 int8
 ```
 
@@ -229,8 +222,3 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. Run GPU
 integration tests serially. The individual Op suites remain the numerical/state-transition oracle;
 the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.
-
-The old/new Qwen3.8 binding matrix uses `out/qwen3_8_27b_old.ninfer` and
-`out/qwen3_8_27b_nvfp4_old.ninfer` for the legacy inventories, and the canonical filenames above
-for the companion artifacts. The legacy paths may be overridden with
-`NINFER_QWEN3_8_27B_OLD_WEIGHTS` and `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`.

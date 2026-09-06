@@ -1,5 +1,4 @@
 #include "ninfer/engine.h"
-#include "../qwen3_6/speculative_page_boundary.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -105,7 +104,6 @@ int main(int argc, char** argv) {
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
         ninfer::Engine engine(options);
-        ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
         require(first.generated_token_ids == reference,
