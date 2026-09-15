@@ -9,6 +9,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
+#include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -177,10 +178,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                 DFlashConfig::local_capacity,
                                                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                                                 static_cast<std::int32_t>(plan.max_concurrency));
-            dflash.rewrite_checkpoint_local = plan_cyclic_kv_cache(
-                builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
-                DFlashConfig::kv_heads, DFlashConfig::head_dim,
-                static_cast<std::int32_t>(plan.max_concurrency));
             PagedKVPoolSpec full_pool{
                 .page_group_count      = physical_pages,
                 .logical_page_capacity = logical_pages,

@@ -5,9 +5,8 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
-                                             const DFlashPersistentLayout& layout,
-                                             CyclicKVCache& local_state)
-    : local(local_state), prefill_features(layout.prefill_features.bind(backing)),
+                                             const DFlashPersistentLayout& layout)
+    : local(backing, layout.local), prefill_features(layout.prefill_features.bind(backing)),
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (layout.full) { full.emplace(backing, *layout.full); }
@@ -18,13 +17,12 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
         full.has_value() != (DFlashConfig::full_layers != 0)) {
         throw std::invalid_argument("masked draft persistent cache layout is invalid");
     }
-    if (full &&
-        (full->layers() != DFlashConfig::full_layers ||
-         full->max_context() != layout.full->max_context || full->page_pool().plane_count() != 2 ||
-         full->page_pool().plane(0).dtype != DType::BF16 ||
-         full->page_pool().plane(0).ne[0] != DFlashConfig::head_dim ||
-         full->page_pool().plane(0).ne[1] != kPagedKVPageSize ||
-         full->page_pool().plane(0).ne[3] != DFlashConfig::kv_heads)) {
+    if (full && (full->layers() != DFlashConfig::full_layers ||
+                 full->max_context() != layout.full->max_context ||
+                 full->pool().plane_count() != 2 || full->pool().plane(0).dtype != DType::BF16 ||
+                 full->pool().plane(0).ne[0] != DFlashConfig::head_dim ||
+                 full->pool().plane(0).ne[1] != kPagedKVPageSize ||
+                 full->pool().plane(0).ne[3] != DFlashConfig::kv_heads)) {
         throw std::invalid_argument("masked draft full cache layout is invalid");
     }
 }

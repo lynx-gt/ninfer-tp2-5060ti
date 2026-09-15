@@ -22,15 +22,15 @@ using TensorLayout = TensorRegion;
 
 struct DFlashPersistentLayout {
     CyclicKVCacheLayout local;
-    CyclicKVCacheLayout rewrite_checkpoint_local;
-    qwen3_6::PagedKVCacheLayout full;
+    // 上游 master 的 DFlash2 只在本 layout 里登记 full（draft 的 full attention KV）；
+    // local（滑窗 KV）的复用检查点用 slot 级拷贝，不再需要第二份 cache。
+    std::optional<qwen3_6::PagedKVCacheLayout> full;
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes() +
-               full.payload_bytes();
+        return local.payload_bytes() + (full ? full->payload_bytes() : 0);
     }
 };
 

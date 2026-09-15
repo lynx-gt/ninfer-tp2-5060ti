@@ -1847,7 +1847,6 @@ void ProgramImplCore::prepare_graphs() {
             }
         };
         zero_cyclic_cache(dflash->local);
-        zero_cyclic_cache(dflash->rewrite_checkpoint_local);
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
                                    dflash->prefill_features.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,
