@@ -121,4 +121,16 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
 
+
+// DFlash2 稀疏草稿接受路径的执行承诺：所有行都是 greedy 且无罚项时不需要 workspace。
+struct SpeculativeAcceptExecutionEnvelope {
+    bool all_rows_greedy_without_penalties = false;
+};
+
+// token_domain 固定的稀疏接受 profile 在 [min_drafts,max_drafts]x[min_batch,max_batch]
+// 区间上所需的 caller-owned 暂存容量。
+[[nodiscard]] std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
+    std::int32_t token_domain, SpeculativeAcceptExecutionEnvelope envelope, std::int32_t min_drafts,
+    std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch);
+
 } // namespace ninfer::ops

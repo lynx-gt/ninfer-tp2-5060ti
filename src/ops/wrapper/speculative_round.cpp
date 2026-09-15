@@ -179,4 +179,27 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
+
+namespace {
+
+constexpr std::int32_t kSparseMaxDrafts   = 15;
+constexpr std::int32_t kSparseTokenDomain = 248077;
+constexpr std::int32_t kSparseMaxBatch    = 8;
+
+} // namespace
+
+std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
+    std::int32_t token_domain, SpeculativeAcceptExecutionEnvelope envelope, std::int32_t min_drafts,
+    std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch) {
+    if (token_domain != kSparseTokenDomain || min_drafts < 1 || max_drafts < min_drafts ||
+        max_drafts > kSparseMaxDrafts || min_batch < 1 || max_batch < min_batch ||
+        max_batch > kSparseMaxBatch) {
+        throw std::invalid_argument("sparse speculative accept workspace: unsupported profile");
+    }
+    if (envelope.all_rows_greedy_without_penalties) { return 0; }
+    const std::size_t row_bytes =
+        sampling_workspace_capacity_bytes(token_domain, min_drafts + 1, max_drafts + 1);
+    return row_bytes * static_cast<std::size_t>(max_batch);
+}
+
 } // namespace ninfer::ops
