@@ -261,6 +261,20 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp
+  ops/launcher/rmsnorm_pack_tail.cu
+  ops/wrapper/rmsnorm_pack_tail.cpp
+  ops/linear_topk/linear_topk.cpp
+  ops/linear_topk/fp8.cu
+  ops/linear_topk/fp8_m64.cu
+  ops/linear_topk/merge.cu
+  ops/linear_topk/q4.cu
+  ops/linear_topk/q4_m64.cu
+  ops/linear_topk/w8.cu
+  ops/linear_topk/w8_m64.cu
+  ops/wrapper/candidate_selector.cpp
+  ops/wrapper/dynamic_grouped_conv.cpp
+  ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.cpp
+  ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu
   ops/linear/w8/w8_feature.cu
   # DFlash2 op 集（master 独有，随 dflash2 引擎整合移植）
   ops/attn_input_proj/w8/w8_dflash2_attn_input.cu
