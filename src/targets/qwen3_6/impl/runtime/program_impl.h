@@ -1437,8 +1437,8 @@ void ProgramImplCore::prepare_graphs() {
             reserve_rows_in(*p.decoder->mtp_cache(), peer_mtp_capture_allocations, p.device.stream,
                             "peer MTP KV cache");
         });
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
+    } else if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        reserve_capture_rows(*dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
     }
     synchronize_all();
 
@@ -1536,7 +1536,9 @@ void ProgramImplCore::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
-        if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+        if (dflash && dflash->full) {
+            zero_capture_pages(*dflash->full, dflash_capture_allocations, batch_size);
+        }
         on_peer([&](PeerRuntime& p) {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 p.decoder->linear_attention.zero_slot(
