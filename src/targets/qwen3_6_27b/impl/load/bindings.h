@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -252,38 +254,6 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
-struct DFlash2DynamicConvPlan {
-    artifact::ObjectHandle base_kernel;
-    WeightPlan kernel_projection;
-};
-
-struct DFlash2LayerPlan {
-    artifact::ObjectHandle input_norm;
-    DFlash2DynamicConvPlan attention_conv;
-    WeightPlan query_key_value;
-    artifact::ObjectHandle query_norm;
-    artifact::ObjectHandle key_norm;
-    WeightPlan attention_output;
-    artifact::ObjectHandle post_attention_norm;
-    DFlash2DynamicConvPlan mlp_conv;
-    WeightPlan gate_up;
-    WeightPlan down;
-};
-
-struct DFlash2CandidateSelectorPlan {
-    WeightPlan hidden_projection;
-    artifact::ObjectHandle predecessor_codebook;
-    artifact::ObjectHandle successor_codebook;
-};
-
-struct DFlash2Plan {
-    WeightPlan feature_projection;
-    artifact::ObjectHandle context_norm;
-    std::array<DFlash2LayerPlan, qwen3_6::DFlash2Weights::layer_count> layers;
-    artifact::ObjectHandle final_norm;
-    DFlash2CandidateSelectorPlan candidate_selector;
-};
-
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -295,7 +265,6 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
-    std::optional<DFlash2Plan> dflash2;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
@@ -374,7 +343,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlash2Weights,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;

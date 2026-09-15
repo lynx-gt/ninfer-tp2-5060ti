@@ -100,7 +100,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     // 差别只在 attention/GDN 投影**没有** BF16 例外层（那 9 层在本产物里保持 NVFP4，
     // 因为 TP2 的列并行路径只接受 NVFP4/FP8）。
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-w4a4") {
-        return WeightsProfile::Qwen38Nvfp4W4A4;
+        // 实验：改用 v1 形状（attention/GDN = FP8）以隔离「引擎 NVFP4 列并行」问题
+        return WeightsProfile::Qwen38Nvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
@@ -146,14 +147,20 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 
-std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model,
-                                                          SequencePlan&& plan,
-                                                          DeviceContext& device,
-                                                          const StartupObserver& startup_observer) {
+std::unique_ptr<Package::Program>
+Package::create_program(const LoadedModel& model, SequencePlan&& plan,
+                        ExecutionContext& execution) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
-                                                    model.impl_->weights_profile, std::move(plan),
-                                                    device, startup_observer);
+    const detail::LoadedModelData& data = model.impl_->data;
+    if (data.tp != execution.tp) {
+        throw std::invalid_argument(
+            "loaded model shard width does not match the execution context");
+    }
+    const detail::RuntimeModelView* peer =
+        data.runtime_peer.has_value() ? &*data.runtime_peer : nullptr;
+    return qwen3_6::create_program<detail::Variant>(data.runtime, peer,
+                                                   model.impl_->weights_profile, std::move(plan),
+                                                   execution);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

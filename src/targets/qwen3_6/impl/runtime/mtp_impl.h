@@ -1,7 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
-#include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
@@ -138,8 +137,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
@@ -151,7 +150,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
-    const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
+    const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
@@ -170,7 +169,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
         Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
-        const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
+        const ops::GqaExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);
         CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
@@ -181,7 +180,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 }
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                           MtpCausalAttentionEnvelopes envelopes) {
+                           MtpGqaEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
@@ -221,110 +220,129 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                        tp->device->stream));
         }
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
-                         state.execution.linear_attention, state.execution.io,
-                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache, &state.mtp_cache);
-        Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
-        Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
-        Tensor current_extents    = frame.current_extents.slice(0, 0, batch_size);
-        Tensor target_valid       = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor current_drafts     = frame.current_drafts.slice(1, 0, batch_size);
-        Tensor target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
-        Tensor text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
-        Tensor mtp_rows           = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
-        Tensor state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
-        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
-        Tensor rope_deltas        = frame.rope_deltas.slice(0, 0, batch_size);
-        Tensor verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
-        Tensor target_positions   = frame.target_positions.slice(1, 0, batch_size);
-        Tensor target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
-        Tensor target_logits      = frame.target_logits.slice(2, 0, batch_size);
-        Tensor target_hidden      = frame.target_hidden.slice(2, 0, batch_size);
-        Tensor selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size);
-        Tensor licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
-        Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
-        Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
-        Tensor next_extents       = frame.next_extents.slice(0, 0, batch_size);
-        Tensor alignment_ids      = frame.alignment_ids.slice(1, 0, batch_size);
-        Tensor alignment_hidden   = frame.alignment_hidden.slice(2, 0, batch_size);
-        Tensor ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
-        Tensor next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
-        Tensor ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
-        Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
-        Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
-        Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
+        TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                         state.execution.rope_frequency, {}, state.execution.linear_attention,
+                         state.execution.io, state.execution.prefill_hidden,
+                         state.execution.prefill_chunk, 0, {}, &state.text_cache,
+                         &state.mtp_cache, tp ? &*tp : nullptr);
 
-        ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
-                                               verify_ids, target_positions,
-                                               state.execution.device.stream);
-        {
-            nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
-                                           static_cast<std::uint64_t>(width) * batch_size);
+        MtpRoundView v = slice_mtp_frame(frame, batch_size);
+
+        if (!tp) {
+            ops::speculative_prepare_verify_inputs(v.anchors, v.current_drafts, v.frontiers,
+                                                   v.current_extents, v.verify_ids,
+                                                   v.target_positions,
+                                                   state.execution.device.stream);
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                                 TargetVerifyFrameView{
-                                     .ids                     = verify_ids,
-                                     .cache_positions         = target_positions,
-                                     .rope_positions          = target_rope,
-                                     .valid_columns           = target_valid,
-                                     .kv_table_rows           = text_rows,
-                                     .state_source_slots      = state_sources,
-                                     .state_destination_slots = state_destinations,
-                                     .target_hidden           = target_hidden,
-                                     .target_logits           = target_logits,
-                                     .target_tokens           = target_tokens,
-                                     .drafts                  = current_drafts,
-                                     .current_extents         = current_extents,
-                                     .frontiers               = frontiers,
-                                     .anchors                 = anchors,
-                                     .licensed_tokens         = licensed_tokens,
-                                     .licensed_counts         = licensed_counts,
-                                     .accepted_drafts         = accepted,
-                                     .selected_hidden         = selected_hidden,
-                                     .replay_records          = state.execution.replay_records,
-                                     .sampling                = frame.sampling,
-                                 },
+                                 verify_view(v, state.execution.replay_records),
                                  envelopes.target_verify);
-        }
 
-        {
-            nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
-                                          static_cast<std::uint64_t>(k) * batch_size);
-            ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
-                                        licensed_counts, rope_deltas, alignment_ids, next_extents,
-                                        ar_positions, ar_rope_positions, ar_valid_columns,
+            ops::mtp_prepare_next_round(v.verify_ids, v.anchors, v.accepted, v.frontiers,
+                                        v.budgets, v.licensed_counts, v.rope_deltas,
+                                        v.alignment_ids, v.next_extents, v.ar_positions,
+                                        v.ar_rope_positions, v.ar_valid_columns,
                                         static_cast<std::int32_t>(state.text_cache.max_context()),
                                         state.execution.device.stream);
-            card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
-                                          target_rope, licensed_counts, mtp_rows, envelopes.batch,
-                                          alignment_hidden);
-            ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
+            card.mtp_forward_decode_batch(v.alignment_ids, v.target_hidden, v.target_positions,
+                                          v.target_rope, v.licensed_counts, v.mtp_rows,
+                                          envelopes.batch, v.alignment_hidden);
+            ops::speculative_select_accepted_hidden(v.alignment_hidden, v.accepted, v.ar_hidden,
                                                     state.execution.device.stream);
 
-            Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
-            Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+            Tensor draft0 = v.next_drafts.slice(1, 0, 1).view({batch_size});
+            card.mtp_propose_batch(v.ar_hidden, v.proposal_logits, draft0);
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
                 Tensor previous =
-                    next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
-                Tensor next =
-                    next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1).view({batch_size});
+                    v.next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
+                Tensor next = v.next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1)
+                                  .view({batch_size});
                 Tensor position =
-                    ar_positions.slice(1, static_cast<std::int32_t>(step), 1).view({1, batch_size});
-                Tensor rope = ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
+                    v.ar_positions.slice(1, static_cast<std::int32_t>(step), 1).view({1,
+                                                                                      batch_size});
+                Tensor rope = v.ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
                                   .view({1, batch_size});
-                Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
+                Tensor valid = v.ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
                                    .view({batch_size});
                 Tensor previous_batch    = previous.view({1, batch_size});
-                Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
-                Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
+                Tensor hidden_batch      = v.ar_hidden.view({TextConfig::hidden, 1, batch_size});
+                Tensor next_hidden_batch = v.next_hidden.view({TextConfig::hidden, 1, batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              mtp_rows, envelopes.ar[step], next_hidden_batch);
-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice,
+                                              v.mtp_rows, envelopes.ar[step], next_hidden_batch);
+                card.mtp_propose_batch(v.next_hidden, v.proposal_logits, next);
+                CUDA_CHECK(cudaMemcpyAsync(v.ar_hidden.data, v.next_hidden.data,
+                                           v.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));
+            }
+        } else {
+            const ExecutionContext& ec = *tp->execution;
+            MtpRoundView p         = slice_mtp_frame(*tp->io->mtp_decode, batch_size);
+            MtpRoundView* views[2] = {&v, &p};
+            for_each_rank(ec, [&](int rank) {
+                MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
+                ops::speculative_prepare_verify_inputs(r.anchors, r.current_drafts, r.frontiers,
+                                                       r.current_extents, r.verify_ids,
+                                                       r.target_positions, ec.dev[rank]->stream);
+            });
+            target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                 verify_view(v, state.execution.replay_records),
+                                 verify_view(p, tp->replay_records), envelopes.target_verify);
+            for_each_rank(ec, [&](int rank) {
+                MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
+                ops::mtp_prepare_next_round(
+                    r.verify_ids, r.anchors, r.accepted, r.frontiers, r.budgets, r.licensed_counts,
+                    r.rope_deltas, r.alignment_ids, r.next_extents, r.ar_positions,
+                    r.ar_rope_positions, r.ar_valid_columns,
+                    static_cast<std::int32_t>(state.text_cache.max_context()),
+                    ec.dev[rank]->stream);
+            });
+            card.mtp_forward_decode_batch(v.alignment_ids, {v.target_hidden, p.target_hidden},
+                                          {v.target_positions, p.target_positions},
+                                          {v.target_rope, p.target_rope},
+                                          {v.licensed_counts, p.licensed_counts},
+                                          {v.mtp_rows, p.mtp_rows}, envelopes.batch,
+                                          {v.alignment_hidden, p.alignment_hidden});
+            for_each_rank(ec, [&](int rank) {
+                MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
+                ops::speculative_select_accepted_hidden(r.alignment_hidden, r.accepted, r.ar_hidden,
+                                                        ec.dev[rank]->stream);
+            });
+
+            const std::array<Tensor, 2> proposal_logits = {v.proposal_logits, p.proposal_logits};
+            Tensor draft0 = v.next_drafts.slice(1, 0, 1).view({batch_size});
+            card.mtp_propose_batch({v.ar_hidden, p.ar_hidden}, proposal_logits, draft0);
+            for (std::uint32_t step = 0; step + 1 < k; ++step) {
+                Tensor previous =
+                    v.next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
+                Tensor next = v.next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1)
+                                  .view({batch_size});
+                std::array<Tensor, 2> position;
+                std::array<Tensor, 2> rope;
+                std::array<Tensor, 2> valid;
+                std::array<Tensor, 2> hidden_batch;
+                std::array<Tensor, 2> next_hidden_batch;
+                for (std::size_t r = 0; r < 2; ++r) {
+                    MtpRoundView& view = *views[r];
+                    position[r] = view.ar_positions.slice(1, static_cast<std::int32_t>(step), 1)
+                                      .view({1, batch_size});
+                    rope[r] = view.ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
+                                  .view({1, batch_size});
+                    valid[r] = view.ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
+                                   .view({batch_size});
+                    hidden_batch[r] = view.ar_hidden.view({TextConfig::hidden, 1, batch_size});
+                    next_hidden_batch[r] =
+                        view.next_hidden.view({TextConfig::hidden, 1, batch_size});
+                }
+                Tensor previous_batch = previous.view({1, batch_size});
+                card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
+                                              {v.mtp_rows, p.mtp_rows}, envelopes.ar[step],
+                                              next_hidden_batch);
+                card.mtp_propose_batch({v.next_hidden, p.next_hidden}, proposal_logits, next);
+                for_each_rank(ec, [&](int rank) {
+                    MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
+                    CUDA_CHECK(cudaMemcpyAsync(r.ar_hidden.data, r.next_hidden.data,
+                                               r.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                               ec.dev[rank]->stream));
+                });
             }
         }
 
@@ -335,14 +353,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 }
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              MtpCausalAttentionEnvelopes envelopes,
-                              DecodeGraphDefinition& definition) {
+                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition) {
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
     capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
+                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable) {
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
     run_prepared(state, executable, body);
 }

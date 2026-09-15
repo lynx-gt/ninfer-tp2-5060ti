@@ -118,9 +118,18 @@ GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens, std
     };
 }
 
+struct GdnPrefillConvRoots {
+    Tensor projected;
+    Tensor convolved;
+};
+
 template <class Config, class Allocator>
-Tensor gdn_prefill_conv(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::convolution_dim, tokens);
+GdnPrefillConvRoots gdn_prefill_conv(Allocator& allocator, std::int32_t tokens,
+                                     std::int32_t tp = 1) {
+    return {
+        matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens),
+        matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens),
+    };
 }
 
 template <class Config, class Allocator>
@@ -283,18 +292,6 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
     };
-}
-
-// Dynamic-convolution outputs remain live through the corresponding attention/MLP branch.
-struct DFlash2BranchRoots {
-    Tensor prepared;
-    Tensor finish_delta;
-};
-
-template <class Config, class Allocator>
-DFlash2BranchRoots dflash2_branch(Allocator& allocator, std::int32_t width, std::int32_t batch) {
-    return {allocator.alloc(DType::BF16, {Config::hidden, width, batch}),
-            allocator.alloc(DType::BF16, {320, 2, width, batch})};
 }
 
 struct DFlashMlpRoots {

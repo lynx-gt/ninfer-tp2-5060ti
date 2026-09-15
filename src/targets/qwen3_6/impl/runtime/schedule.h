@@ -3,22 +3,23 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
-#include "core/decode_graph.h"
 #include "core/device.h"
-#include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "ninfer/ops/swa.h"
+#include "core/decode_graph.h"
+#include "runtime/contract/transient_region.h"
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
+#include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
-#include <ninfer/targets/qwen3_6/decoder_state.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <optional>
 #include <span>
@@ -132,8 +133,8 @@ struct PrefillContext {
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
-    std::int32_t state_source_slot                          = 0;
-    std::int32_t state_destination_slot                     = 0;
+    std::int32_t current_state_slot                         = 0;
+    std::int32_t rewrite_checkpoint_state_slot              = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
@@ -176,15 +177,15 @@ struct DFlashAppendContext {
     DFlashPersistentState& dflash;
 };
 
-struct MtpCausalAttentionEnvelopes {
-    ops::CausalAttentionExecutionEnvelope target_verify;
-    ops::CausalAttentionExecutionEnvelope batch;
-    std::array<ops::CausalAttentionExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
+struct MtpGqaEnvelopes {
+    ops::GqaExecutionEnvelope target_verify;
+    ops::GqaExecutionEnvelope batch;
+    std::array<ops::GqaExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
 };
 
 struct DFlashEnvelopes {
-    ops::SlidingWindowAttentionExecutionEnvelope local;
-    ops::ContextAttentionExecutionEnvelope full;
+    ops::SwaContextExecutionEnvelope local;
+    ops::GqaContextExecutionEnvelope full;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
@@ -194,15 +195,12 @@ struct TargetVerifyFrameView {
     Tensor rope_positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     Tensor target_hidden;
     Tensor target_logits;
     Tensor target_tokens;
     Tensor drafts;
     Tensor current_extents;
-    Tensor candidate_ids;
-    Tensor proposal_q;
     Tensor frontiers;
     Tensor anchors;
     Tensor licensed_tokens;
@@ -215,22 +213,30 @@ struct TargetVerifyFrameView {
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
+                         const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
+                         std::int32_t rewrite_checkpoint_state_slot,
+                         std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::CausalAttentionExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope);
+// tp == 2 form. `peer` is rank 1's identically-shaped view of ITS OWN frame; the acceptance
+// arithmetic is replicated there rather than transferred, because every one of its inputs is
+// either the ingress record (copied to both frames) or the gathered logits (bit-identical on both
+// ranks). What is NOT replicated is rank 0's bookkeeping: the continuation-hidden scatter and the
+// egress transfer stay on rank 0 alone.
+void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                          TextContext& card, TargetVerifyFrameView frame,
+                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope);
 
-[[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
-                                                    std::span<const TokenId> ids,
-                                                    std::uint32_t nominal_length,
-                                                    std::optional<std::uint32_t> split_frontier,
-                                                    bool finalize_at_end);
+[[nodiscard]] PrefillChunkResult prefill_text_chunk(
+    PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
-                         std::optional<std::uint32_t> split_frontier, bool finalize_at_end);
+                         std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
+                         bool finalize_at_end);
 
 struct MtpBridgeInput {
     const Tensor* previous_hidden = nullptr;
@@ -251,19 +257,17 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 // ordinary ingress, share one model schedule, publish continuation hidden by selector, and leave
 // through one compact egress transfer.
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   ops::GqaExecutionEnvelope envelope,
                                    DecodeGraphDefinition& definition);
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                           ops::CausalAttentionExecutionEnvelope envelope,
-                           DecodeGraphExecutable* executable);
+                           ops::GqaExecutionEnvelope envelope, DecodeGraphExecutable* executable);
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              MtpCausalAttentionEnvelopes envelopes,
-                              DecodeGraphDefinition& definition);
+                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable);
+                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
@@ -277,11 +281,10 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
-                                 ops::CausalAttentionExecutionEnvelope target_envelope,
+                                 ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes,
-                         ops::CausalAttentionExecutionEnvelope target_envelope,
+                         DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -6,7 +6,6 @@
 
 #include <array>
 #include <cstdint>
-#include <ninfer/types.h>
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
 
@@ -70,9 +69,6 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr SpeculativeBackend backend = SpeculativeBackend::DFlash;
-    static constexpr bool coherent_selector     = false;
-    static constexpr int full_layers            = 1;
     static constexpr bool supported        = true;
     static constexpr int layers            = 6;
     static constexpr int local_layers      = 5;

@@ -34,7 +34,6 @@
 #include "core/decode_graph.h"
 
 #include "core/device.h"
-#include "core/nvtx.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -230,7 +229,18 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
 }
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
-    nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
+    capture(stream, body, DecodeGraphPeerCapture{});
+}
+
+void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body,
+                                    const DecodeGraphPeerCapture& peer) {
+    const bool dual = peer.bridge != nullptr;
+    if (dual) {
+        if (!peer.bridge->live() || peer.stream == nullptr) {
+            throw std::invalid_argument("dual-device capture requires a live peer bridge and "
+                                        "the peer device's stream");
+        }
+    }
     reset();
 
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
@@ -287,7 +297,6 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
 }
 
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
-    nvtx::ScopedRange instantiate_range(nvtx::Name::CudaGraphInstantiate, nvtx::Category::Graph);
     if (!definition.ready()) {
         throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
     }
@@ -303,7 +312,6 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
 }
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
-    nvtx::ScopedRange update_range(nvtx::Name::CudaGraphUpdate, nvtx::Category::Graph);
     if (!ready() || !definition.ready()) {
         throw std::logic_error("CUDA Graph update requires a definition and executable");
     }
@@ -318,14 +326,11 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
-    nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
     CUDA_CHECK(cudaGraphUpload(exec_, stream));
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
-    // This range executes for every replay; ranges in the captured body execute only at capture.
-    nvtx::ScopedRange launch_range(nvtx::Name::CudaGraphLaunch, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
     CUDA_CHECK(cudaGraphLaunch(exec_, stream));
 }
