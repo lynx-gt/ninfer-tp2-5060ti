@@ -1,4 +1,3 @@
-#include <cstdio>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
@@ -350,14 +349,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
-    if (plan.persistent.dflash) {
-        std::fprintf(stderr, "[dbg] emplace dflash: local_layers=%u pending=%d,%d,%d\n",
-                     plan.persistent.dflash->local.layer_count(),
-                     plan.persistent.dflash->pending_features.ne[0],
-                     plan.persistent.dflash->pending_features.ne[1],
-                     plan.persistent.dflash->pending_features.ne[2]);
-        dflash.emplace(backing, *plan.persistent.dflash);
-    }
+    if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
