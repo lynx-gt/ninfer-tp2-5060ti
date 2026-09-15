@@ -27,7 +27,7 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
             if (rewrite_checkpoint) {
-                state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->lanes[0],
+                state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->active_lanes[0],
                                                       state.execution.device.stream);
             }
         });

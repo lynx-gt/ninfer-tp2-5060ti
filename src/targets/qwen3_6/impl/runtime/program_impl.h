@@ -766,7 +766,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
             *dflash_host_ingress                         = {};
-            dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->active_lanes[0]                = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
             CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
@@ -957,7 +957,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
                 hidden                            = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
-                destinations = frame.lanes.slice(0, 0, batch);
+                destinations = frame.active_lanes.slice(0, 0, batch);
             } else {
                 throw std::logic_error("partial speculative commit has no target frame");
             }
@@ -1590,7 +1590,7 @@ void ProgramImplCore::prepare_graphs() {
                     static_cast<std::int32_t>(extent + 1U);
                 dflash_host_ingress->text_kv_table_rows[row]   = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row] = static_cast<std::int32_t>(row);
-                dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(row);
+                dflash_host_ingress->active_lanes[row]                = static_cast<std::int32_t>(row);
                 dflash_host_ingress->sampling[row]             = {};
             }
         }
@@ -2094,7 +2094,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
         dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
-        dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(lane);
+        dflash_host_ingress->active_lanes[row]                = static_cast<std::int32_t>(lane);
         materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
@@ -2105,7 +2105,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
                                sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                device.stream));
     const auto batch     = static_cast<std::int32_t>(lanes.size());
-    Tensor lane_tensor   = frame.lanes.slice(0, 0, batch);
+    Tensor lane_tensor   = frame.active_lanes.slice(0, 0, batch);
     Tensor device_starts = frame.context_frontiers.slice(0, 0, batch);
     Tensor device_ends   = frame.execution_frontiers.slice(0, 0, batch);
     Tensor table_rows    = frame.dflash_kv_table_rows.slice(0, 0, batch);
@@ -2721,7 +2721,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
-            dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->active_lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }

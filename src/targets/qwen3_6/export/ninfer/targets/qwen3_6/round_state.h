@@ -81,7 +81,12 @@ struct DFlashDecodeIngress {
         target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    // 上游 master 的 DFlash 用 active_lanes + 状态槽（source/destination）表达"哪个 lane、
+    // 它的 live 槽与复用检查点槽"；本 fork 的 local cache 用 lane 语义（2*max_concurrency 槽），
+    // 两个槽号在这里仍然照 master 传下来，落地在 DFlashPersistentState 的 lane 重载里。
+    std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -259,7 +264,9 @@ struct DFlashDecodeState {
     Tensor target_rope_positions;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
-    Tensor lanes;
+    Tensor active_lanes;
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
