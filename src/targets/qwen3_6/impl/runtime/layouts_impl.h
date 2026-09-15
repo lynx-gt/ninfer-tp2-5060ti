@@ -9,7 +9,6 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
-#include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
