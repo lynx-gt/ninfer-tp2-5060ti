@@ -75,6 +75,11 @@ public:
 
     [[nodiscard]] const PagedKVPool& pool() const noexcept { return pool_; }
 
+    // 上游 master 的 DFlash2 代码按 page_pool() 访问；本 fork 沿用 pool() 命名，这里做等价别名。
+    [[nodiscard]] PagedKVPool& page_pool() noexcept { return pool_; }
+
+    [[nodiscard]] const PagedKVPool& page_pool() const noexcept { return pool_; }
+
     [[nodiscard]] PagedKVCacheView execution_view(const PagedKVAllocation& allocation) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
