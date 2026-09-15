@@ -401,21 +401,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor attention_batch = roots.attention.view(
                     {Config::head_dim, Config::query_heads, width, batch_size});
                 if (layer < Config::local_layers) {
-                    ops::sliding_window_attention(
-                        query_batch, key_batch, value_batch, positions, valid_columns,
-                        state_destinations,
-                        {Config::head_dim, Config::query_heads, Config::kv_heads},
-                        Config::local_capacity, Config::attention_scale,
-                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                        envelopes.local, state.execution.work, attention_batch,
-                        state.execution.device.stream);
+                    ops::swa(query_batch, key_batch, value_batch, positions, valid_columns,
+                             state_destinations, Config::attention_scale,
+                             dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                             envelopes.local, state.execution.work, attention_batch,
+                             state.execution.device.stream);
                 } else {
-                    ops::context_softmax_attention(
-                        query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        {Config::head_dim, Config::query_heads, Config::kv_heads},
-                        Config::attention_scale, dflash_state(state).full_batch_layer(0),
-                        envelopes.full, state.execution.work, attention_batch,
-                        state.execution.device.stream);
+                    ops::gqa_attention(query_batch, key_batch, value_batch,
+                                       positions.view({width, batch_size}), valid_columns, full_rows,
+                                       Config::attention_scale,
+                                       dflash_state(state).full_batch_layer(0), envelopes.full,
+                                       state.execution.work, attention_batch,
+                                       state.execution.device.stream);
                 }
                 ops::linear_add(roots.attention.view({Config::query_size, columns}),
                                 weight.attention_output, residual, state.execution.work,

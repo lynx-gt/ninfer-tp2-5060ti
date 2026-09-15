@@ -572,11 +572,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         matrix(layout, DType::BF16, DFlashConfig::kv_size, tokens);
                         matrix(layout, DType::BF16, DFlashConfig::kv_size, tokens);
                         matrix(layout, DType::BF16, DFlashConfig::query_size, tokens);
-                        scratch(layout, ops::sliding_window_attention_workspace_capacity_bytes(
-                                            {DFlashConfig::head_dim, DFlashConfig::query_heads,
-                                             DFlashConfig::kv_heads},
-                                            DFlashConfig::local_capacity, {0, plan.capacity}, width,
-                                            width, batch));
                         scratch(layout,
                                 ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
                                     DFlashConfig::query_size, width, width, batch, batch));
