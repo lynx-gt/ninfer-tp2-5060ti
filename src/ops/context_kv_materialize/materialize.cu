@@ -25,7 +25,8 @@ struct DeviceLayerView {
     const std::uint8_t* value_scales;
     const __nv_bfloat16* key_norm;
     __nv_bfloat16* cache_k;
-    __half* cache_v;
+    // 本 fork 的 cyclic KV 缓存 V 面是 BF16（上游 master 用 FP16），此处按本 fork 的存储约定。
+    __nv_bfloat16* cache_v;
     std::int32_t padded_capacity;
 };
 
@@ -291,7 +292,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
                                                       (long long)layer.padded_capacity *
                                                           (row / 128 + 8 * slots[request]));
-                layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
+                layer.cache_v[dst] = __float2bfloat16_rn(result);
             }
         }
     }
@@ -335,7 +336,7 @@ struct MaterializeProjectionEpilogue {
             const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
                                                   (long long)layer.padded_capacity *
                                                       (row / 128 + 8 * slots[request]));
-            layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
+            layer.cache_v[dst] = __float2bfloat16_rn(result);
         }
     }
 
