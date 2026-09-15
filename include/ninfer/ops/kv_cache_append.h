@@ -3,21 +3,13 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/kv_cache_append_prefix.h"  // 共享 envelope 定义（本 fork 的 prefix 家族）
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ninfer::ops {
-
-/**
- * Host launch-resource promise for device-selected prefix append. It bounds every device count
- * during capture/replay but neither selects nor publishes a committed frontier.
- */
-struct KVCacheAppendPrefixExecutionEnvelope {
-    std::uint32_t min_count = 0;
-    std::uint32_t max_count = 0;
-};
 
 /**
  * Append every K/V row to single-sequence paged growing-cache storage.
