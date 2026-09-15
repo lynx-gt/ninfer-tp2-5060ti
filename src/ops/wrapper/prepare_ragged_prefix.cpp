@@ -14,8 +14,7 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
                            Tensor& counts, cudaStream_t stream) {
     std::fprintf(stderr,
                  "[dbg] ragged in: src=%d,%d,%d,%d dest=%d,%d,%d,%d pos=%d,%d,%d,%d "
-                 "lanes=%d,%d starts=%d,%d ends=%d,%d counts=%d,%d
-",
+                 "lanes=%d,%d starts=%d,%d ends=%d,%d counts=%d,%d\n",
                  source.ne[0], source.ne[1], source.ne[2], source.ne[3], destination.ne[0],
                  destination.ne[1], destination.ne[2], destination.ne[3], positions.ne[0],
                  positions.ne[1], positions.ne[2], positions.ne[3], lanes.ne[0], lanes.ne[1],
