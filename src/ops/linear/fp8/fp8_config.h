@@ -188,6 +188,72 @@ struct Fp8VocabularyA16MmaProductionSchedule {
     using Type                           = Fp8A16MmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
 };
 
+// 上游 master 的 FP8 A16 small-T MMA schedule（本 fork 的 attn_input/gdn_input
+// 与 linear_topk 都用它；插回本文件以免三处引用找不到定义）。
+enum class Fp8A16SmallTMmaActivationStage : std::uint8_t {
+    ActiveOnly,
+    PaddedZero,
+};
+
+enum class Fp8A16SmallTMmaCache : std::uint8_t {
+    Default,
+    Streaming,
+};
+
+template <int KWarps, int TileTokens, int MinBlocksPerSm,
+          Fp8A16SmallTMmaCache ActivationCache = Fp8A16SmallTMmaCache::Default,
+          Fp8A16SmallTMmaCache WeightCache     = Fp8A16SmallTMmaCache::Streaming,
+          Fp8A16SmallTMmaActivationStage ActivationStage =
+              Fp8A16SmallTMmaActivationStage::ActiveOnly>
+struct Fp8A16SmallTMmaSchedule {
+    static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
+    static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
+                  TileTokens == 40 || TileTokens == 48);
+    static_assert(MinBlocksPerSm > 0);
+
+    static constexpr int kKWarps            = KWarps;
+    static constexpr int kTileTokens        = TileTokens;
+    static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
+    static constexpr auto kActivationCache  = ActivationCache;
+    static constexpr auto kWeightCache      = WeightCache;
+    static constexpr auto kActivationStage  = ActivationStage;
+    static constexpr int kThreads           = KWarps * 32;
+    static constexpr int kTileKPerWarp      = 64;
+    static constexpr int kGroupK            = KWarps * kTileKPerWarp;
+    static constexpr int kRowsPerCta        = 16;
+    static constexpr int kRowsPerLoaderWarp = kRowsPerCta / KWarps;
+};
+
+using Fp8AttnInputGeometry       = Fp8Geometry<14336, 5120>;
+using Fp8GdnInputGeometry        = Fp8Geometry<16384, 5120>;
+using Fp8MlpGateUpGeometry       = Fp8Geometry<34816, 5120>;
+using Fp8VocabularyGeometry      = Fp8Geometry<248320, 5120>;
+using Fp8Residual6144Geometry    = Fp8Geometry<5120, 6144>;
+using Fp8Residual17408Geometry   = Fp8Geometry<5120, 17408>;
+using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
+using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
+using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
+
+inline constexpr std::int32_t kFp8VocabularyFirstA16SmallTMmaT = 1;
+inline constexpr std::int32_t kFp8VocabularyLastA16SmallTMmaT  = 48;
+inline constexpr std::int32_t kFp8VocabularyFirstA16GemmT      = 42;
+
+template <int ActiveTokens>
+struct Fp8VocabularyA16SmallTMmaProductionSchedule {
+    static_assert(ActiveTokens >= kFp8VocabularyFirstA16SmallTMmaT);
+    static_assert(ActiveTokens <= kFp8VocabularyLastA16SmallTMmaT);
+
+    static constexpr int kTileTokens     = ActiveTokens <= 8    ? 8
+                                           : ActiveTokens <= 16 ? 16
+                                           : ActiveTokens <= 24 ? 24
+                                           : ActiveTokens <= 32 ? 32
+                                           : ActiveTokens <= 40 ? 40
+                                                                : 48;
+    static constexpr int kKWarps         = ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
+    static constexpr int kMinBlocksPerSm = kKWarps == 16 ? 1 : 2;
+    using Type = Fp8A16SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
+};
+
 enum class Fp8Problem : std::uint8_t {
     AttnInput,
     GdnInput,
