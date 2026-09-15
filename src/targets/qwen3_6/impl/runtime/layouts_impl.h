@@ -146,7 +146,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp) {
+        // DFlash2（草稿在两卡复制运行）由本 fork 打开 TP2 路径；35B DFlash 仍然只支持 tp1。
+        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp &&
+            plan.speculative_backend != SpeculativeBackend::DFlash2) {
             throw std::invalid_argument(
                 "DFlash speculative decoding has no tensor-parallel path in this build");
         }
@@ -169,7 +171,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
-            if (tp != 1) {
+            // DFlash2 的 draft 权重按复制绑定（见 bindings.cpp 的 shard_mapping），TP2 下可用。
+            if (tp != 1 && plan.speculative_backend != SpeculativeBackend::DFlash2) {
                 throw std::invalid_argument("DFlash has no tensor-parallel path in this build");
             }
             DFlashPersistentLayout& dflash = out.dflash.emplace();
