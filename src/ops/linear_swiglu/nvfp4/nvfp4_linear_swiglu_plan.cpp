@@ -22,8 +22,7 @@ enum class Nvfp4LinearSwiGluRoute {
     TmaFusedW4A4,
 };
 
-constexpr std::int32_t kTmaBlockM = 256;
-constexpr std::int32_t kFusedMaxTokens = 128;
+constexpr std::int32_t kPrimaryT = 1024;
 
 // A pure function of (policy, token count), not of N/K, so it is inherited unchanged by the tp2
 // shard -- the same "route selection depends only on the family, not the halved extent" rule
@@ -40,10 +39,8 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-    if (tokens <= kFusedMaxTokens) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
-    if (tokens >= kTmaBlockM && (tokens % kTmaBlockM) == 0) {
-        return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
-    }
+    if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
+    if (tokens == kPrimaryT) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 }
 
@@ -93,22 +90,19 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
     if (policy == LinearPolicy::A16Only || max_tokens <= 4) { return 0; }
 
     std::size_t maximum = 0;
-    if (min_tokens <= kFusedMaxTokens && max_tokens >= 5) {
-        maximum = fused_workspace_bytes(std::min(max_tokens, kFusedMaxTokens));
+    if (min_tokens <= 48 && max_tokens >= 5) {
+        maximum = fused_workspace_bytes<Geometry>(std::min(max_tokens, 48));
     }
-    if (max_tokens >= kTmaBlockM) {
-        const std::int32_t largest_fused = max_tokens - (max_tokens % kTmaBlockM);
-        if (largest_fused >= std::max(min_tokens, kTmaBlockM)) {
-            maximum = std::max(maximum, fused_workspace_bytes(largest_fused));
-        }
+    if (min_tokens <= kPrimaryT && max_tokens >= kPrimaryT) {
+        maximum = fused_workspace_bytes<Geometry>(kPrimaryT);
     }
 
     std::int32_t last_baseline = max_tokens;
     if (resolve_route(policy, last_baseline) == Nvfp4LinearSwiGluRoute::TmaFusedW4A4) {
         --last_baseline;
     }
-    if (last_baseline >= std::max(min_tokens, kFusedMaxTokens + 1)) {
-        maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
+    if (last_baseline >= std::max(min_tokens, 49)) {
+        maximum = std::max(maximum, baseline_workspace_bytes<Geometry>(last_baseline));
     }
     return maximum;
 }

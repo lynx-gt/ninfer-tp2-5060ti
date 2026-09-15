@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/arena.h"
-#include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/allreduce.h" // ExecutionContext (tp2 split form)
 
@@ -43,12 +42,10 @@ namespace ninfer::ops {
  * with that oracle under the Op's named criterion. All inputs and outputs are non-overlapping.
  * `ws` provides the transient capacity reported above and is scoped to the call; there is no
  * persistent state side effect.
- * `execution` supplies the stream and the selected device's physical multiprocessor count. The
- * latter may change private launch decomposition but never the mathematical result.
  */
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
-                     Tensor& beta, DeviceExecutionView execution);
+                     Tensor& beta, cudaStream_t stream);
 
 /**
  * Registered contiguous-parent storage forms of gdn_gating_proj:
@@ -62,7 +59,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
  */
 void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
                      const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g, Tensor& beta,
-                     DeviceExecutionView execution);
+                     cudaStream_t stream);
 
 /**
  * Applies the Qwen3.6 GDN input RMSNorm and control projection as one semantic Op:
@@ -80,20 +77,18 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  * through h. Private tensor-core operand staging remains an implementation choice. The tensor and
  * weight domains otherwise match the two-weight gdn_gating_proj form. The implementation may fuse
  * or compose its internal kernels for any positive T; that route is not observable at this
- * boundary. A contiguous [hidden,W,B] block is presented as the matrix with T=W*B; each
- * column has its own norm and controls. DFlash2 target verification uses W=2..16, B=1..8
- * (T<=128), without restricting the positive-T matrix contract.
+ * boundary.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
-                          Tensor& beta, DeviceExecutionView execution);
+                          Tensor& beta, cudaStream_t stream);
 
 /** The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
-                          DeviceExecutionView execution);
+                          cudaStream_t stream);
 
 // --- Tensor-parallel split form (tp == 2) -------------------------------------------------------
 //

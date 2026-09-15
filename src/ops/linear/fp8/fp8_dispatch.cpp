@@ -69,12 +69,9 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
-    if (problem == Fp8Problem::Vocabulary && x.ne[1] >= kFp8VocabularyFirstA16GemmT) {
-        launch_fp8_vocabulary_a16_gemm(x, weight, out, stream);
-        return;
-    }
-    const std::int32_t chunk = problem == Fp8Problem::Vocabulary ? kFp8VocabularyLastA16SmallTMmaT
-                                                                 : fp8_linear_small_t_max(problem);
+    const std::int32_t chunk = is_fp8_vocabulary_problem(problem)
+                                   ? kFp8VocabularyLastA16MmaT
+                                   : fp8_linear_small_t_max(problem);
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += chunk) {
         const std::int32_t active = std::min(chunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
@@ -83,8 +80,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
-        if (problem == Fp8Problem::Vocabulary) {
-            launch_fp8_vocabulary_a16_small_t(input_chunk, weight, output_chunk, stream);
+        if (is_fp8_vocabulary_problem(problem)) {
+            launch_fp8_vocabulary_a16_mma(input_chunk, weight, output_chunk, stream);
         } else if (active == 1) {
             launch_fp8_decode(input_chunk, weight, output_chunk, stream);
         } else {
