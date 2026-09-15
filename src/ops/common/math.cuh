@@ -42,7 +42,16 @@ __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
     return load_vec<__half2>(&bits);
 }
 
+__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
+    const __half2 packed = __floats2half2_rn(lo, hi);
+    return load_vec<std::uint32_t>(&packed);
+}
 
+__device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_bits(std::uint32_t bits) {
+    const __nv_bfloat162 source = load_vec<__nv_bfloat162>(&bits);
+    const __half2 converted =
+        __halves2half2(__half(__low2bfloat16(source)), __half(__high2bfloat16(source)));
+    return load_vec<std::uint32_t>(&converted);
 }
 
 __device__ __forceinline__ int4 bf16x8_bits_to_f16x8_bits(int4 bits) {
@@ -51,14 +60,6 @@ __device__ __forceinline__ int4 bf16x8_bits_to_f16x8_bits(int4 bits) {
         static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.y))),
         static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.z))),
         static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.w))));
-}
-
-
-}
-
-__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
-    const __half2 packed = __floats2half2_rn(lo, hi);
-    return load_vec<std::uint32_t>(&packed);
 }
 
 } // namespace ninfer::ops
