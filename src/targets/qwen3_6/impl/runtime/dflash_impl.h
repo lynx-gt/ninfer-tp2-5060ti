@@ -282,12 +282,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
                 Tensor attention =
                     work.alloc(DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
-                ops::sliding_window_attention(
-                    query, key, value, positions, valid_columns, state_slots,
-                    {Config::head_dim, Config::query_heads, Config::kv_heads},
-                    Config::local_capacity, Config::attention_scale,
-                    state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
-                    envelopes.local, work, attention, stream);
+                ops::swa(query, key, value, positions, valid_columns, state_slots,
+                         Config::attention_scale,
+                         state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
+                         envelopes.local, work, attention, stream);
                 finish_dynamic_branch(
                     state.execution, attention.view({Config::query_size, width, batch}),
                     layer.attention_output, layer.attention_conv, branch.finish_delta, residual);
