@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
+#include "core/nvtx.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -10,9 +11,8 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/embedding.h"
-#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -21,10 +21,11 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/sliding_window_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
 
@@ -97,6 +98,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
+        nvtx::ScopedRange append_range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash,
+                                       static_cast<std::uint64_t>(columns));
         if (width <= 0 || batch <= 0 || features.dtype != DType::BF16 ||
             features.ne[0] != Config::feature_rows || features.ne[3] != 1 ||
             positions.dtype != DType::I32 || positions.ne[0] != width || positions.ne[1] != batch ||
@@ -340,14 +343,16 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         using Config               = typename V::DFlashConfig;
         const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
         const std::int32_t columns = width * batch_size;
-        Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers           = frame.execution_frontiers.slice(0, 0, batch_size);
-        Tensor valid_columns       = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor lanes               = frame.lanes.slice(0, 0, batch_size);
-        Tensor full_rows           = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
-        Tensor ids                 = frame.proposal_ids.slice(1, 0, batch_size);
-        Tensor positions           = frame.proposal_positions.slice(1, 0, batch_size);
-        Tensor drafts              = frame.draft_tokens.slice(1, 0, batch_size);
+        nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
+                                         static_cast<std::uint64_t>(columns));
+        Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
+        Tensor valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
+        Tensor full_rows          = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
+        Tensor ids                = frame.proposal_ids.slice(1, 0, batch_size);
+        Tensor positions          = frame.proposal_positions.slice(1, 0, batch_size);
+        Tensor drafts             = frame.draft_tokens.slice(1, 0, batch_size);
 
         state.execution.work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns, Config::mask_token, ids,
@@ -357,9 +362,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                        state.execution.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
+            nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
+                                          static_cast<std::uint64_t>(layer));
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
             {
+                nvtx::ScopedRange attention_range(nvtx::Name::DFlashAttention,
+                                                  nvtx::Category::Attention,
+                                                  static_cast<std::uint64_t>(layer));
                 auto attention_scope = state.execution.work.scope();
                 auto roots =
                     workspace_recipe::dflash_attention<Config>(state.execution.work, columns);
@@ -391,14 +401,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor attention_batch = roots.attention.view(
                     {Config::head_dim, Config::query_heads, width, batch_size});
                 if (layer < Config::local_layers) {
-                    ops::swa(query_batch, key_batch, value_batch, positions, valid_columns, lanes,
-                             Config::attention_scale,
-                             dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                             envelopes.local, state.execution.work, attention_batch,
-                             state.execution.device.stream);
+                    ops::sliding_window_attention(
+                        query_batch, key_batch, value_batch, positions, valid_columns,
+                        state_destinations,
+                        {Config::head_dim, Config::query_heads, Config::kv_heads},
+                        Config::local_capacity, Config::attention_scale,
+                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                        envelopes.local, state.execution.work, attention_batch,
+                        state.execution.device.stream);
                 } else {
-                    ops::bidirectional_gqa_attention(
+                    ops::context_softmax_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
+                        {Config::head_dim, Config::query_heads, Config::kv_heads},
                         Config::attention_scale, dflash_state(state).full_batch_layer(0),
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
@@ -408,6 +422,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 state.execution.device.stream);
             }
             {
+                nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,
+                                            static_cast<std::uint64_t>(layer));
                 auto mlp_scope = state.execution.work.scope();
                 auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
@@ -462,7 +478,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
-                              ops::GqaExecutionEnvelope target_envelope) {
+                              ops::CausalAttentionExecutionEnvelope target_envelope) {
     return [&state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
@@ -501,20 +517,20 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
             DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
-        ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
-                                   frontiers, compact_features, append_positions, append_counts,
-                                   state.execution.device.stream);
+        ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
+                                   context_starts, frontiers, compact_features, append_positions,
+                                   append_counts, state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
-                                     lanes, dflash_rows, envelopes.append);
+                                     state_destinations, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                         state.execution.rope_frequency, {}, state.execution.linear_attention,
-                         state.execution.io, state.execution.prefill_hidden,
-                         state.execution.prefill_chunk, 0, {}, &state.text_cache);
+        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, active_lanes, valid_columns, width, batch_size);
         {
@@ -583,14 +599,15 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
-                                 ops::GqaExecutionEnvelope target_envelope,
+                                 ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
+                         DFlashEnvelopes envelopes,
+                         ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);

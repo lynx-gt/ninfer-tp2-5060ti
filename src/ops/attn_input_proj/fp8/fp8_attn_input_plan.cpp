@@ -20,39 +20,19 @@ Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("fp8 attn_input_proj: unsupported policy");
     }
-    return tokens >= 11 ? Fp8AttnInputRoute::A8 : Fp8AttnInputRoute::A16;
+    return tokens >= 5 ? Fp8AttnInputRoute::A8 : Fp8AttnInputRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                 Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    constexpr std::int32_t kChunk  = kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
-        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
-        auto* query = static_cast<std::uint8_t*>(q.data) +
-                      static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* output_gate = static_cast<std::uint8_t*>(gate.data) +
-                            static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* key = static_cast<std::uint8_t*>(k.data) +
-                    static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
-        auto* value = static_cast<std::uint8_t*>(v.data) +
-                      static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor query_chunk(query, DType::BF16, {kQRows, active});
-        Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
-        Tensor key_chunk(key, DType::BF16, {kKvRows, active});
-        Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-        if (active == 1) {
-            fp8_attn_input_decode_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                         value_chunk, stream);
-        } else {
-            fp8_attn_input_small_t_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                          value_chunk, stream);
-        }
-    }
+    if (x.ne[1] == 1)
+        fp8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
+    else if (x.ne[1] <= kFp8AttnInputLastSimtT)
+        fp8_attn_input_small_t_launch(x, weight, q, gate, k, v, stream);
+    else if (x.ne[1] <= kFp8AttnInputLastSmallMmaT)
+        fp8_attn_input_a16_small_mma_launch(x, weight, q, gate, k, v, stream);
+    else
+        fp8_attn_input_a16_gemm_launch(x, weight, q, gate, k, v, stream);
 }
 
 } // namespace
@@ -81,60 +61,6 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
     auto scope                   = workspace->scope();
     const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
     fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);
-}
-
-// The tp2 column shard -- halved row counts (Fp8AttnInputTp2ColumnGeometry's own
-// q=3072, k=512, gate=3072, v=512).
-namespace {
-
-void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                      Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kQRows  = 3072;
-    constexpr std::int32_t kKvRows = 512;
-    constexpr std::int32_t kChunk  = kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
-        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input                = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
-        auto* query = static_cast<std::uint8_t*>(q.data) +
-                      static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* output_gate = static_cast<std::uint8_t*>(gate.data) +
-                            static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* key = static_cast<std::uint8_t*>(k.data) +
-                    static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
-        auto* value = static_cast<std::uint8_t*>(v.data) +
-                      static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor query_chunk(query, DType::BF16, {kQRows, active});
-        Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
-        Tensor key_chunk(key, DType::BF16, {kKvRows, active});
-        Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-        if (active == 1) {
-            fp8_attn_input_decode_launch_shard(input_chunk, weight, query_chunk, gate_chunk,
-                                               key_chunk, value_chunk, stream);
-        } else {
-            fp8_attn_input_small_t_launch_shard(input_chunk, weight, query_chunk, gate_chunk,
-                                                key_chunk, value_chunk, stream);
-        }
-    }
-}
-
-} // namespace
-
-void fp8_attn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                   Tensor& k, Tensor& v, LinearPolicy policy,
-                                   WorkspaceArena* workspace, cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Fp8AttnInputRoute::A16) {
-        launch_a16_shard(x, weight, q, gate, k, v, stream);
-        return;
-    }
-    if (workspace == nullptr) {
-        throw std::invalid_argument(
-            "fp8 A8 attn_input_proj column-parallel requires caller workspace");
-    }
-    auto scope                   = workspace->scope();
-    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
-    fp8_attn_input_a8_launch_shard(x, weight, q, gate, k, v, scratch, stream);
 }
 
 } // namespace ninfer::ops::detail

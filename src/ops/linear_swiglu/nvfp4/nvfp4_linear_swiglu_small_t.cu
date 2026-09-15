@@ -15,7 +15,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <class Geometry, int ActiveTokens, class Schedule>
+using Geometry              = Nvfp4MlpGateUpGeometry;
+constexpr int kIntermediate = Geometry::kOutputRows / 2;
+
+template <int ActiveTokens, class Schedule>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -32,7 +35,6 @@ __global__ __launch_bounds__(
     static_assert((Schedule::kWarpsPerCta % 4) == 0);
     static_assert((128 % Schedule::kWarpsPerCta) == 0);
 
-    constexpr int kIntermediate = Geometry::kOutputRows / 2;
     __shared__ Nvfp4SmallTSharedStorage<Geometry, ActiveTokens, Schedule> shared;
     constexpr int kCtasPerM128                    = 128 / Schedule::kWarpsPerCta;
     const int block                               = static_cast<int>(blockIdx.x);
@@ -72,9 +74,8 @@ __global__ __launch_bounds__(
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <class Geometry, int ActiveTokens>
+template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    constexpr int kIntermediate             = Geometry::kOutputRows / 2;
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
@@ -85,7 +86,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_linear_swiglu_small_t_kernel<Geometry, ActiveTokens, Schedule>
+    nvfp4_linear_swiglu_small_t_kernel<ActiveTokens, Schedule>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -94,28 +95,20 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Geometry, std::size_t... Offsets>
+template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<Geometry, kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-template <class Geometry>
-constexpr auto kLaunchers =
-    make_launchers<Geometry>(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
 
 } // namespace
 
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
-    kLaunchers<Nvfp4MlpGateUpGeometry>[index](x, weight, out, stream);
-}
-
-void nvfp4_linear_swiglu_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
-                                              cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
-    kLaunchers<Nvfp4MlpGateUpTp2ColumnGeometry>[index](x, weight, out, stream);
+    kLaunchers[index](x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

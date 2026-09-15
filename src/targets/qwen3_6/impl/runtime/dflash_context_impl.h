@@ -14,7 +14,6 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
     if (local.layer_count() != DFlashConfig::local_layers ||
         local.capacity() != DFlashConfig::local_capacity ||
         local.num_kv_heads() != DFlashConfig::kv_heads ||
-        rewrite_checkpoint_local.num_kv_heads() != DFlashConfig::kv_heads ||
         local.head_dim() != DFlashConfig::head_dim ||
         full.has_value() != (DFlashConfig::full_layers != 0)) {
         throw std::invalid_argument("masked draft persistent cache layout is invalid");
@@ -39,12 +38,10 @@ PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t laye
     return full->batch_layer_view(layer);
 }
 
-void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream) {
-    rewrite_checkpoint_local.copy_lane_from(local, lane, stream);
-}
-
-void DFlashPersistentState::restore_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream) {
-    local.copy_lane_from(rewrite_checkpoint_local, lane, stream);
+void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t source_slot,
+                                                    std::int32_t destination_slot,
+                                                    cudaStream_t stream) {
+    local.copy_slot_from(local, source_slot, destination_slot, stream);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
