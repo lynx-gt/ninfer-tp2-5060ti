@@ -260,7 +260,17 @@ add_library(ninfer_ops STATIC
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
-  ops/wrapper/vision_pos_embed.cpp)
+  ops/wrapper/vision_pos_embed.cpp
+  # DFlash2 op set（来自上游 master，随 dflash2 引擎整合一起移植）
+  ops/attn_input_proj/w8/w8_dflash2_attn_input.cu
+  ops/linear_swiglu/w8/w8_dflash2_linear_swiglu.cu
+  ops/candidate_selector/bf16/candidate_selector_path.cu
+  ops/candidate_selector/bf16/candidate_selector_path_plan.cpp
+  ops/context_kv_materialize/context_kv_materialize.cpp
+  ops/context_kv_materialize/materialize.cu
+  ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu
+  ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
+  ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
