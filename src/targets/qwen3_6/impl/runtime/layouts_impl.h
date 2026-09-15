@@ -174,10 +174,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 throw std::invalid_argument("DFlash has no tensor-parallel path in this build");
             }
             DFlashPersistentLayout& dflash = out.dflash.emplace();
+            // lane 布局：前 max_concurrency 个是 live 槽，后 max_concurrency 个是各 lane 的
+            // 复用检查点槽（上游 master 用 StateImage 表达这件事，本 fork 没有那层，直接在
+            // 同一份 local cache 里留出检查点槽）。
             dflash.local = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
                                                 DFlashConfig::local_capacity,
                                                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
-                                                static_cast<std::int32_t>(plan.max_concurrency));
+                                                static_cast<std::int32_t>(2 * plan.max_concurrency));
             PagedKVPoolSpec full_pool{
                 .page_group_count      = physical_pages,
                 .logical_page_capacity = logical_pages,

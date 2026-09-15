@@ -42,4 +42,14 @@ void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t source_slot,
     local.copy_slot_from(local, source_slot, destination_slot, stream);
 }
 
+void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream) {
+    const auto base = static_cast<std::int32_t>(local.lane_capacity() / 2);
+    local.copy_slot_from(local, lane, base + lane, stream);
+}
+
+void DFlashPersistentState::restore_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream) {
+    const auto base = static_cast<std::int32_t>(local.lane_capacity() / 2);
+    local.copy_slot_from(local, base + lane, lane, stream);
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
