@@ -170,7 +170,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      });
     }
     if constexpr (Variant::supports_dflash) {
-        if (plan.features.dflash()) {
+        // masked-draft 家族（35B DFlash 与 27B DFlash2）共用同一套 DFlash 持久状态布局。
+        if (plan.features.masked_draft()) {
             // DFlash2 的 draft 权重按复制绑定（见 bindings.cpp 的 shard_mapping），TP2 下可用。
             if (tp != 1 && plan.speculative_backend != SpeculativeBackend::DFlash2) {
                 throw std::invalid_argument("DFlash has no tensor-parallel path in this build");
