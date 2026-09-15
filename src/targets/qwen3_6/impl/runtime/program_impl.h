@@ -1582,7 +1582,9 @@ void ProgramImplCore::prepare_graphs() {
                     checked_i32(frontier, "graph representative DFlash frontier");
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
-                dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
+                // 物理宽度 W = 可验证草稿数 K + 1（本函数里 K = extent）
+                dflash_host_ingress->proposal_valid_columns[row] =
+                    static_cast<std::int32_t>(extent + 1U);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
