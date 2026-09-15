@@ -1,5 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 
+#include <cstdio>
+
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -10,6 +12,13 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (layout.full) { full.emplace(backing, *layout.full); }
+    std::fprintf(stderr,
+                 "[dbg] dflash ctor: layers=%u/%d cap=%u/%d kv=%d/%d dim=%d/%d full=%d/%d
+",
+                 local.layer_count(), DFlashConfig::local_layers, local.capacity(),
+                 DFlashConfig::local_capacity, local.num_kv_heads(), DFlashConfig::kv_heads,
+                 local.head_dim(), DFlashConfig::head_dim, full.has_value() ? 1 : 0,
+                 DFlashConfig::full_layers != 0 ? 1 : 0);
     if (local.layer_count() != DFlashConfig::local_layers ||
         local.capacity() != DFlashConfig::local_capacity ||
         local.num_kv_heads() != DFlashConfig::kv_heads ||
