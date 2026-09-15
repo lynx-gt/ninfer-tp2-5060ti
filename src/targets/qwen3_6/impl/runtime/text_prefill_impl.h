@@ -21,7 +21,7 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
             auto& frame  = *state.execution.io.dflash_decode;
             Tensor count = frame.append_counts.slice(0, 0, 1);
-            Tensor lane  = frame.lanes.slice(0, 0, 1);
+            Tensor lane  = frame.active_lanes.slice(0, 0, 1);
             Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
             ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
