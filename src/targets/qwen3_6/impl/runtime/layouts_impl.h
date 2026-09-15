@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
+#include "targets/qwen3_6/impl/runtime/yarn_rope.h"
 
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -119,7 +120,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .full_attention_layers     = TextConfig::full_attention_layers(),
                      .mtp_layers                = TextConfig::mtp_layers,
                      .capacity                  = plan.capacity,
-                     .kv_heads                  = TextConfig::kv_heads,
+                     .kv_heads                  = TextConfig::kv_heads / tp,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
@@ -153,14 +154,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     out.state_images = qwen3_6::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
+        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument(
+                "DFlash speculative decoding has no tensor-parallel path in this build");
+        }
+        // ONE device's replay records, exactly like the decoder state above: the GDN verify round
+        // records this device's own head/channel shard, and the registered
+        // FoldGeometry<48, 8, 24, 5120> is the shape the peer's fold consumes. The RECORD
+        // CAPACITY and WIDTH are not divided -- both devices record the same rows and the same
+        // draft window.
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
                          .layers          = TextConfig::gdn_layers(),
                          .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
-                         .conv_channels   = TextConfig::convolution_dim,
-                         .qk_heads        = TextConfig::gdn_key_heads,
-                         .value_heads     = TextConfig::gdn_value_heads,
+                         .conv_channels   = TextConfig::convolution_dim / tp,
+                         .qk_heads        = TextConfig::gdn_key_heads / tp,
+                         .value_heads     = TextConfig::gdn_value_heads / tp,
                          .key_dim         = TextConfig::gdn_key_head_dim,
                          .value_dim       = TextConfig::gdn_value_head_dim,
                      });
@@ -365,6 +375,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto mtp_prefill_chunk = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                        std::int32_t last, bool preembedded) {
         auto call = layout.scope();
+        if (plan.tp > 1) {
+            // tp2 only: the final-chunk stage's own one-column all-reduce staging, distinct from
+            // the chunk-wide [hidden, T] staging planned by tp_mtp_call_roots.
+            matrix(layout, DType::BF16, TextConfig::hidden, 1);
+        }
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         {
@@ -390,9 +405,46 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         proposal_scratch(layout, 1);
     };
 
+    // Tensor-parallel additions, live for a whole call rather than one stage:
+    //   * `allreduce staging`  - the peer's contribution to every row-parallel reduce ([hidden, T]
+    //                            BF16, one per device, allocated once per call and reused by all
+    //                            128 reduces).
+    //   * `vocabulary half`    - this device's own half of the logits, before the gather. The
+    //                            GATHERED full logits go straight into each rank's persistent
+    //                            RoundState logits, so they cost no workspace. Only the columns
+    //                            that actually get a logit are planned: one in prefill (the bonus
+    //                            token), `batch` in a decode round.
+    // Every OTHER extent in this plan is still the tp1 (whole-model) extent: at tp == 2 each
+    // device's real per-stage need is at most that, so planning it whole is a safe over-estimate.
+    // Sizing the sharded stages exactly is a follow-up (it only buys workspace bytes back).
+    const auto tp_call_roots = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
+                                   std::int32_t logit_columns) {
+        if (plan.tp <= 1) { return; }
+        matrix(layout, DType::BF16, TextConfig::hidden, tokens);
+        matrix(layout, DType::BF16, TextConfig::output_rows / plan.tp, logit_columns);
+    };
+
+    // The MTP round's own tp2 additions. Its three all-reduces share ONE [hidden, T] staging
+    // buffer per device (allocated once per MTP call, reused by the stem's fc, the attention
+    // output projection and the post-mixer), and the proposal head's gather needs this device's
+    // own half of the proposal logits alongside the full gathered vector the tp1 plan already
+    // covers. Every other MTP extent is planned at the tp1 (whole-model) width above, which
+    // over-plans a tp2 device rather than under-planning it.
+    const auto tp_mtp_call_roots = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
+                                       std::int32_t logit_columns) {
+        if (plan.tp <= 1) { return; }
+        matrix(layout, DType::BF16, TextConfig::hidden, tokens);
+        matrix(layout, DType::BF16,
+               (plan.proposal_head == ProposalHead::Optimized ? Variant::draft_head_rows
+                                                              : TextConfig::output_rows) /
+                   plan.tp,
+               logit_columns);
+    };
+
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
+    tp_call_roots(text_prefill, chunk, 1);
     target_body(text_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                 1, chunk, text_envelope);
     scratch(text_prefill, ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1));
@@ -411,6 +463,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
         matrix(ordinary, DType::BF16, TextConfig::hidden, batch);
+        tp_call_roots(ordinary, batch, batch);
         target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
         scratch(ordinary,
@@ -421,6 +474,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     if (plan.features.mtp()) {
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
+        tp_call_roots(mtp_prefill, chunk, 1);
+        tp_mtp_call_roots(mtp_prefill, chunk, 1);
         target_body(mtp_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill,
                     1, 1, chunk, text_envelope);
         matrix(mtp_prefill, DType::I32, 1, chunk);
@@ -436,12 +491,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.mtp_prefill = finish(mtp_prefill);
 
         WorkspaceLayoutBuilder mtp_batch;
+        tp_mtp_call_roots(mtp_batch, verify, 1);
         mtp_full_call(mtp_batch, verify, text_envelope, false);
         WorkspaceLayoutBuilder mtp_ar;
+        tp_mtp_call_roots(mtp_ar, 1, 1);
         mtp_full_call(mtp_ar, 1, text_envelope, true);
         WorkspaceLayoutBuilder mtp_align;
+        tp_mtp_call_roots(mtp_align, 1, 1);
         mtp_full_call(mtp_align, 1, text_envelope, false);
         WorkspaceLayoutBuilder mtp_proposal;
+        tp_mtp_call_roots(mtp_proposal, 1, 1);
         proposal_scratch(mtp_proposal, 1);
         const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
             TextConfig::token_domain, drafts, drafts, 1, 1);
@@ -453,6 +512,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
             matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            tp_call_roots(target, aggregate, aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
 
@@ -473,10 +533,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             WorkspaceLayoutBuilder alignment;
+            tp_mtp_call_roots(alignment, batch * verify, batch);
             mtp_decode_core(alignment, verify);
             WorkspaceLayoutBuilder ar;
+            tp_mtp_call_roots(ar, batch, batch);
             mtp_decode_core(ar, 1);
             WorkspaceLayoutBuilder proposal;
+            tp_mtp_call_roots(proposal, batch, batch);
             proposal_scratch(proposal, batch);
             const std::size_t batch_accept =
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
@@ -642,10 +705,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options) {
-    if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
-        throw std::invalid_argument("max_context exceeds the variant native context capacity");
-    }
+// Returns the EFFECTIVE context ceiling the options were admitted against: the variant's
+// registered native capacity under `RopeMode::Native`, `yarn_origin * yarn_factor` under
+// `RopeMode::Yarn`. The single caller passes it straight into the sequence plan, so the ceiling is
+// resolved exactly once per Engine construction.
+std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions& options) {
+    // This call is also where every rope-option rejection lives (unsupported variant, Vision,
+    // DFlash, wrong origin, factor that overshoots the 1,048,576 product ceiling) -- see
+    // yarn_rope.h.
+    const std::uint32_t effective_max_context = qwen3_6::detail::rope_effective_max_context(
+        options, qwen3_6::detail::RopeDomain{kNativeMaxContext, kSupportsYarnRope});
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
@@ -704,6 +773,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
     }
+    return effective_max_context;
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -724,6 +794,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
+    impl->rope_mode           = inputs.rope_mode;
+    impl->yarn_factor         = inputs.yarn_factor;
+    impl->yarn_origin         = inputs.yarn_origin;
+    impl->effective_max_context = inputs.effective_max_context;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
@@ -736,8 +810,31 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
+            // Per device, at both widths. At tp 2 one cross-device graph replaces the tp 1 graph
+            // but holds BOTH devices' nodes (2.95x the tp 1 node count: each device's halved-width
+            // schedule, the extra un-fused GDN norm, and the collectives' cross-device copies), and
+            // instantiating it materializes driver state on each device it has nodes on.
+            //
+            // Measured on 2x RTX 5090 at max_concurrency 8, 8192 context:
+            //   tp 1: 20 MiB on the one device        (2.5  MiB per concurrent request)
+            //   tp 2: 26 MiB rank 0, 24 MiB rank 1    (3.25 MiB and 3.0 MiB per request)
+            // The tp 2 multiplier is nevertheless raised from 12 to 20 MiB per request, and the
+            // reason is the LOW-concurrency end rather than the measured high end: at
+            // max_concurrency 1 the budget is one multiplier, and an observed one-shot overage of
+            // ~19.9 MiB against a 12 MiB budget on a SINGLE device -- attributed to a late module
+            // load -- is on record. tp 2 doubles that surface, so 12 MiB would be a budget the
+            // measured steady state fits inside and a known transient does not.
+            //
+            // THE MARGIN IS THINNEST AT max_concurrency 1, which is the likely 1M configuration:
+            // the tp 2 per-batch-size eager warm pass in prepare_graphs() only has batch sizes
+            // 2..max_concurrency to warm, so at max_concurrency 1 it does nothing and the sole
+            // code-warm pass carries all the module loading -- inside the measurement window. The
+            // budget there is one multiplier, 20 MiB, against a 0.3b-style worst case of ~19.9
+            // MiB: roughly 1 MiB of headroom. Raising this multiplier, not the warm pass, is the
+            // lever if that transient is ever observed at tp 2.
+            const std::uint64_t per_batch = impl->tp == 2 ? 20ULL * kMiB : 12ULL * kMiB;
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(

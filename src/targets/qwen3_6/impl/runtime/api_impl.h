@@ -597,6 +597,31 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+std::span<const std::uint16_t> Program<Variant>::last_round_logits_bf16() const noexcept {
+    return impl_->last_round_logits_bf16();
+}
+
+template <>
+void Program<Variant>::enable_logits_capture(bool enabled) {
+    impl_->enable_logits_capture(enabled);
+}
+
+template <>
+void Program<Variant>::enable_peer_egress_check(bool enabled) noexcept {
+    impl_->enable_peer_egress_check(enabled);
+}
+
+template <>
+std::uint64_t Program<Variant>::peer_egress_check_rounds() const noexcept {
+    return impl_->peer_egress_check_rounds();
+}
+
+template <>
+std::uint64_t Program<Variant>::peer_egress_check_mismatches() const noexcept {
+    return impl_->peer_egress_check_mismatches();
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

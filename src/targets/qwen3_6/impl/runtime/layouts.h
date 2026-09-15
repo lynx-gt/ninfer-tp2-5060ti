@@ -79,6 +79,16 @@ struct SequencePlanningInputs {
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    // Rotary regime. Nothing in the persistent or workspace layout depends on these:
+    // the YaRN table is a 32-float per-device buffer the Program owns outside the planned arenas,
+    // so a native plan is byte-identical to the pre-YaRN one. They are carried here only so the
+    // Program can build and upload that table without re-reading EngineOptions.
+    RopeMode rope_mode                  = RopeMode::Native;
+    double yarn_factor                  = 0.0;
+    std::uint32_t yarn_origin           = 0;
+    // The ceiling `capacity` was admitted against: the variant's native capacity under Native,
+    // `yarn_origin * yarn_factor` under Yarn.
+    std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
     int device          = 0;
@@ -102,6 +112,11 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    // See SequencePlanningInputs: rope regime carried through the plan, layout-neutral.
+    RopeMode rope_mode                  = RopeMode::Native;
+    double yarn_factor                  = 0.0;
+    std::uint32_t yarn_origin           = 0;
+    std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
     int device          = 0;

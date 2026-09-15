@@ -11,6 +11,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+struct ExecutionContext;
 
 namespace targets {
 
@@ -88,7 +89,7 @@ struct ConstructedTarget {
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
-                                                 DeviceContext& device);
+                                                 ExecutionContext& execution);
 
 } // namespace targets
 } // namespace ninfer

@@ -11,6 +11,109 @@
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace {
+
+// One rank's window into ITS OWN MtpDecodeState, sliced to the round's batch. Both ranks are
+// sliced by the same function so a shape mistake cannot apply to one device only -- which matters
+// because rank 1's buffers live on the other GPU, where an out-of-bounds write is silent: a
+// peer-side write that is exactly in bounds at batch 1 runs off the end of the buffer at batch 2
+// with nothing on the local device noticing.
+struct MtpRoundView {
+    Tensor anchors;
+    Tensor frontiers;
+    Tensor budgets;
+    Tensor current_extents;
+    Tensor target_valid;
+    Tensor current_drafts;
+    Tensor target_rope;
+    Tensor text_rows;
+    Tensor mtp_rows;
+    Tensor lanes;
+    Tensor rope_deltas;
+    Tensor verify_ids;
+    Tensor target_positions;
+    Tensor target_tokens;
+    Tensor target_logits;
+    Tensor target_hidden;
+    Tensor selected_hidden;
+    Tensor licensed_tokens;
+    Tensor licensed_counts;
+    Tensor accepted;
+    Tensor next_extents;
+    Tensor alignment_ids;
+    Tensor alignment_hidden;
+    Tensor ar_hidden;
+    Tensor next_hidden;
+    Tensor ar_positions;
+    Tensor ar_rope_positions;
+    Tensor ar_valid_columns;
+    Tensor next_drafts;
+    Tensor proposal_logits;
+    const ops::SamplingConfig* sampling = nullptr;
+};
+
+MtpRoundView slice_mtp_frame(qwen3_6::MtpDecodeState& frame, std::int32_t batch_size) {
+    MtpRoundView out;
+    out.anchors           = frame.anchors.slice(0, 0, batch_size);
+    out.frontiers         = frame.base_frontiers.slice(0, 0, batch_size);
+    out.budgets           = frame.remaining_budgets.slice(0, 0, batch_size);
+    out.current_extents   = frame.current_extents.slice(0, 0, batch_size);
+    out.target_valid      = frame.target_valid_columns.slice(0, 0, batch_size);
+    out.current_drafts    = frame.current_drafts.slice(1, 0, batch_size);
+    out.target_rope       = frame.target_rope_positions.slice(1, 0, batch_size);
+    out.text_rows         = frame.text_kv_table_rows.slice(0, 0, batch_size);
+    out.mtp_rows          = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
+    out.lanes             = frame.lanes.slice(0, 0, batch_size);
+    out.rope_deltas       = frame.rope_deltas.slice(0, 0, batch_size);
+    out.verify_ids        = frame.verify_ids.slice(1, 0, batch_size);
+    out.target_positions  = frame.target_positions.slice(1, 0, batch_size);
+    out.target_tokens     = frame.target_argmax.slice(1, 0, batch_size);
+    out.target_logits     = frame.target_logits.slice(2, 0, batch_size);
+    out.target_hidden     = frame.target_hidden.slice(2, 0, batch_size);
+    out.selected_hidden   = frame.target_continuation_hidden.slice(1, 0, batch_size);
+    out.licensed_tokens   = frame.licensed_tokens.slice(1, 0, batch_size);
+    out.licensed_counts   = frame.licensed_counts.slice(0, 0, batch_size);
+    out.accepted          = frame.accepted_drafts.slice(0, 0, batch_size);
+    out.next_extents      = frame.next_extents.slice(0, 0, batch_size);
+    out.alignment_ids     = frame.alignment_ids.slice(1, 0, batch_size);
+    out.alignment_hidden  = frame.alignment_hidden.slice(2, 0, batch_size);
+    out.ar_hidden         = frame.ar_hidden.slice(1, 0, batch_size);
+    out.next_hidden       = frame.next_hidden.slice(1, 0, batch_size);
+    out.ar_positions      = frame.ar_positions.slice(0, 0, batch_size);
+    out.ar_rope_positions = frame.ar_rope_positions.slice(0, 0, batch_size);
+    out.ar_valid_columns  = frame.ar_valid_columns.slice(0, 0, batch_size);
+    out.next_drafts       = frame.next_drafts.slice(0, 0, batch_size);
+    out.proposal_logits   = frame.proposal_logits.slice(1, 0, batch_size);
+    out.sampling          = frame.sampling;
+    return out;
+}
+
+TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords* records) {
+    return TargetVerifyFrameView{
+        .ids             = v.verify_ids,
+        .cache_positions = v.target_positions,
+        .rope_positions  = v.target_rope,
+        .valid_columns   = v.target_valid,
+        .kv_table_rows   = v.text_rows,
+        .lanes           = v.lanes,
+        .target_hidden   = v.target_hidden,
+        .target_logits   = v.target_logits,
+        .target_tokens   = v.target_tokens,
+        .drafts          = v.current_drafts,
+        .current_extents = v.current_extents,
+        .frontiers       = v.frontiers,
+        .anchors         = v.anchors,
+        .licensed_tokens = v.licensed_tokens,
+        .licensed_counts = v.licensed_counts,
+        .accepted_drafts = v.accepted,
+        .selected_hidden = v.selected_hidden,
+        .replay_records  = records,
+        .sampling        = v.sampling,
+    };
+}
+
+} // namespace
+
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
@@ -18,12 +121,21 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     if (!state.mtp_kv.valid() || !state.execution.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
+    if (state.execution.peer != nullptr) {
+        // Unreachable backstop, and deliberately kept as one. The bridge resumes the MTP head
+        // from a RETAINED target hidden, which lives only in rank 0's tail/checkpoint stores; the
+        // planner therefore downgrades every tp2 MTP prefix reuse to a full reset before a bridge
+        // can be staged (request_plan_impl.h). Throwing from inside prefill execution would take
+        // the executor down rather than fail one request, which is why the decision is made there.
+        throw std::logic_error("MTP bridge has no tensor-parallel path in this build");
+    }
     if (rope_position.size() != 3) {
         throw std::invalid_argument("MTP bridge requires one three-axis rope position");
     }
     state.execution.work.reset();
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.rope_frequency, state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
@@ -81,6 +193,33 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
+        std::optional<TpExecution> tp = tp_execution(state.execution);
+        if (tp) {
+            // Rank 1 runs the round from ITS OWN copy of the same ingress record. Everything the
+            // peer needs that is not in the ingress -- verify ids, target positions, the accepted
+            // count, the next round's AR positions -- is DERIVED from it by the same deterministic
+            // Ops, run again on device 1, rather than transferred: the only other inputs are the
+            // gathered logits, which are bit-identical on both ranks.
+            if (!tp->io->mtp_decode.has_value()) {
+                throw std::logic_error("tensor-parallel MTP decode requires a peer frame");
+            }
+            // Rank 1 uploads ITS OWN ingress record, not rank 0's. The two differ in exactly one
+            // field per row -- `sampling[row].token_counts`, which must name rank 1's penalty
+            // counter lane. `speculative_accept_greedy_drafts` reads and atomically writes that
+            // pointer in sampling mode, so handing rank 1 a pointer into rank 0's arena is an
+            // illegal access without peer mapping and a silent double-increment with it. Every
+            // other byte is identical, which is what keeps the two replicated accepts in step.
+            const qwen3_6::MtpDecodeIngress* peer_ingress =
+                state.execution.peer->mtp_host_ingress;
+            if (peer_ingress == nullptr) {
+                throw std::logic_error("tensor-parallel MTP decode requires a peer ingress record");
+            }
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            CUDA_CHECK(cudaMemcpyAsync(tp->io->mtp_decode->ingress.data, peer_ingress,
+                                       sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
+                                       tp->device->stream));
+        }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,

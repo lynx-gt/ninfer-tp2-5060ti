@@ -12,6 +12,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+struct ExecutionContext;
 
 namespace artifact {
 class Binder;

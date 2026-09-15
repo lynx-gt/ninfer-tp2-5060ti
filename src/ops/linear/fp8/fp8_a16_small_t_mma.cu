@@ -30,7 +30,7 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
         &launch_tile<8 * (static_cast<int>(Offsets) + 1)>...};

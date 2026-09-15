@@ -13,11 +13,12 @@ namespace ninfer::targets::qwen3_6_27b::detail {
 
 class LoadPlan::Impl {
 public:
-    Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan)
-        : weights_profile(weights_profile_in), plan(std::move(target_plan)) {}
+    Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan, int tensor_parallel)
+        : weights_profile(weights_profile_in), plan(std::move(target_plan)), tp(tensor_parallel) {}
 
     WeightsProfile weights_profile;
     ArtifactLoadPlan plan;
+    int tp = 1;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -95,22 +96,35 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    // 本 fork：自有微调产物（ModelOpt W4A4 → .ninfer）。格式与 Qwen3.6 NVFP4 档相同，
+    // 差别只在 attention/GDN 投影**没有** BF16 例外层（那 9 层在本产物里保持 NVFP4，
+    // 因为 TP2 的列并行路径只接受 NVFP4/FP8）。
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-w4a4") {
+        // 实验：改用 v1 形状（attention/GDN = FP8）以隔离「引擎 NVFP4 列并行」问题
+        return WeightsProfile::Qwen38Nvfp4;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    if (binder.device_count() != options.tp) {
+        throw std::invalid_argument("artifact binder device count does not match EngineOptions.tp");
+    }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options),
+                              options.tp),
+        options.tp));
 }
 
 std::unique_ptr<Package::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
-    auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
+    auto impl = std::make_unique<LoadedModel::Impl>(plan.impl_->weights_profile,
+                                                   std::move(plan.impl_->plan.bindings),
+                                                   std::move(materialized), plan.impl_->tp);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }

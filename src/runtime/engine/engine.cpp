@@ -152,6 +152,11 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
+std::vector<TokenId> PreparedPrompt::debug_token_ids() const {
+    if (impl_ == nullptr) { throw std::logic_error("PreparedPrompt is empty"); }
+    return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
+}
+
 class GenerationHandle::Impl {
 public:
     class Concept {
@@ -263,7 +268,9 @@ public:
     }
 
     EngineOptions options;
-    DeviceContext device;
+    // One or two devices. `execution.primary()` is rank 0 -- the device the executor thread binds
+    // to, the one that owns request bookkeeping, sampling and the emitted tokens.
+    ExecutionContext execution;
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
@@ -532,6 +539,62 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+std::vector<std::uint16_t> Engine::debug_last_round_logits_bf16() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::vector<std::uint16_t> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->debug_last_round_logits_bf16();
+            }
+        },
+        impl_->executor);
+}
+
+void Engine::debug_enable_logit_capture(bool enabled) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [enabled](const auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                executor->debug_enable_logit_capture(enabled);
+            }
+        },
+        impl_->executor);
+}
+
+void Engine::debug_enable_peer_egress_check(bool enabled) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [enabled](const auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                executor->debug_enable_peer_egress_check(enabled);
+            }
+        },
+        impl_->executor);
+}
+
+std::pair<std::uint64_t, std::uint64_t> Engine::debug_peer_egress_check_counts() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::pair<std::uint64_t, std::uint64_t> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->debug_peer_egress_check_counts();
+            }
+        },
+        impl_->executor);
 }
 
 void Engine::reset_memory_peaks() noexcept {

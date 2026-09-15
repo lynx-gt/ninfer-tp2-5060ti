@@ -6,6 +6,7 @@
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
+#include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -84,7 +85,7 @@ void require_tensor_window(const Tensor& t, DType dtype, std::int32_t rows, std:
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
 }
 
-Tensor matrix_window(Tensor& t, std::int32_t cols) {
+Tensor matrix_window(const Tensor& t, std::int32_t cols) {
     if (cols <= 0) { throw std::invalid_argument("matrix_window cols must be positive"); }
     if (t.ne[1] < cols || t.ne[2] != 1 || t.ne[3] != 1) {
         throw std::invalid_argument("matrix_window shape mismatch");
@@ -218,16 +219,25 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
     consume_prefill(feature_window, position_window, rewrite_checkpoint);
 }
 
-TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                         qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
-                         qwen3_6::RoundState& io, Tensor& prefill_hidden,
-                         std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
-                         qwen3_6::PagedKVCacheView mtp_kv,
-                         const qwen3_6::PagedKVCache* batch_text_kv,
-                         const qwen3_6::PagedKVCache* batch_mtp_kv)
+TextContext::TextContext(
+    DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
+    const std::array<ops::RopeFrequencyOverride, kTensorParallelWidth>& rope_frequency,
+    qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
+    Tensor& prefill_hidden, std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
+    qwen3_6::PagedKVCacheView mtp_kv, const qwen3_6::PagedKVCache* batch_text_kv,
+    const qwen3_6::PagedKVCache* batch_mtp_kv, const TpExecution* tp)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+      rope_frequency_(rope_frequency), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
+      tp_(tp) {
+    if (tp_ != nullptr) {
+        if (!tp_->complete() || tp_->execution->tp != 2 || !tp_->events->live()) {
+            throw std::invalid_argument("tensor-parallel TextContext binding is incomplete");
+        }
+        if (mtp_enabled() != (tp_->mtp_kv.valid() || tp_->batch_mtp_kv != nullptr)) {
+            throw std::invalid_argument("tensor-parallel MTP storage disagrees between ranks");
+        }
+    }
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -267,18 +277,64 @@ void TextContext::bind() {
     embed_      = &weights_.token_embedding;
     final_norm_ = &weights_.final_norm;
     lm_head_    = &weights_.output_head;
+    if (tp_ != nullptr) {
+        // Rank 1's bindings point into ITS OWN model view, whose sharded extents are already
+        // halved by the loader. Norms and the embedding table are replicated, so both ranks bind
+        // structurally identical -- but physically distinct, per-device -- objects.
+        const LoadedModelData& peer = *tp_->weights;
+        embed_peer_                 = &peer.token_embedding;
+        final_norm_peer_            = &peer.final_norm;
+        lm_head_peer_               = &peer.output_head;
+        for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+            if (ModelConfig::is_full(layer)) {
+                const std::size_t fidx = static_cast<std::size_t>(ModelConfig::full_idx(layer));
+                FullLayerW& out        = full_peer_[fidx];
+                const auto& source     = peer.full_layers[fidx];
+                out.input_norm         = &source.input_norm;
+                out.projection         = &source.projection;
+                out.o_proj             = &source.output;
+                out.q_norm             = &source.query_norm;
+                out.k_norm             = &source.key_norm;
+                out.post_attn_norm     = &source.post_attention_norm;
+                out.mlp                = bind_mlp(source.post_mixer);
+            } else {
+                const std::size_t gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
+                GdnLayerW& out         = gdn_peer_[gidx];
+                const auto& source     = peer.gdn_layers[gidx];
+                out.input_norm         = &source.input_norm;
+                out.projection         = &source.projection;
+                out.conv1d             = &source.convolution;
+                out.gdn_norm           = &source.norm;
+                out.out_proj           = &source.output;
+                out.post_attn_norm     = &source.post_attention_norm;
+                out.mlp                = bind_mlp(source.post_mixer);
+            }
+        }
+    }
     if (weights_.optimized_proposal) {
         const auto& proposal = *weights_.optimized_proposal;
         set_proposal_head(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
                           proposal.head.n);
+        if (tp_ != nullptr) {
+            if (!tp_->weights->optimized_proposal) {
+                throw std::invalid_argument("tensor-parallel peer has no proposal head shard");
+            }
+            const auto& peer_proposal = *tp_->weights->optimized_proposal;
+            proposal_head_peer_       = &peer_proposal.head;
+            // `draft_head_token_ids` is REPLICATED, so this is the peer's own device copy of
+            // the whole [131072] map, not a 65536-entry slice. Rank 1's copy
+            // is DEAD STORAGE in this build: the remap runs where the argmax runs, which is rank
+            // 0. It is bound anyway, and its presence checked below, because that check is what
+            // proves the loader actually replicated the map rather than sharding it -- 512 KiB
+            // against a ~400 MiB draft head, and the alternative is a loader special case whose
+            // only effect would be to make the placement asymmetric.
+            proposal_head_ids_peer_ =
+                static_cast<const std::int32_t*>(peer_proposal.token_ids.data);
+        }
     }
 
-    if (mtp_enabled()) {
-        if (!weights_.mtp) {
-            throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
-        }
-        const auto& source = *weights_.mtp;
-        mtp_               = MtpW{&source,
+    const auto bind_mtp_weights = [](const auto& source) {
+        return MtpW{&source,
                     &source.input_projection,
                     &source.embedding_norm,
                     &source.hidden_norm,
@@ -288,6 +344,18 @@ void TextContext::bind() {
                     &source.output,
                     &source.post_attention_norm,
                     &source.final_norm};
+    };
+    if (mtp_enabled()) {
+        if (!weights_.mtp) {
+            throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
+        }
+        mtp_ = bind_mtp_weights(*weights_.mtp);
+        if (tp_ != nullptr) {
+            if (!tp_->weights->mtp) {
+                throw std::invalid_argument("tensor-parallel peer has no MTP weight shard");
+            }
+            mtp_peer_ = bind_mtp_weights(*tp_->weights->mtp);
+        }
     }
 
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
@@ -320,6 +388,26 @@ void TextContext::bind() {
 const MtpW& TextContext::mtp_weights() const {
     if (!mtp_enabled()) { throw std::runtime_error("MTP draft weights are not enabled"); }
     return mtp_;
+}
+
+const MtpW& TextContext::mtp_weights_for(int rank) const {
+    if (!mtp_enabled()) { throw std::runtime_error("MTP draft weights are not enabled"); }
+    if (rank == 0) { return mtp_; }
+    if (mtp_peer_.payload == nullptr) {
+        throw std::logic_error("tensor-parallel peer MTP weights are unbound");
+    }
+    return mtp_peer_;
+}
+
+const GdnReplayRecords* TextContext::replay_records_for(int rank) const {
+    if (rank == 0) { return replay_records_; }
+    if (tp_ == nullptr) { throw std::logic_error("TextContext has no tensor-parallel context"); }
+    // The two ranks must agree: a peer with no record storage while rank 0 records would fold a
+    // stale half of the GDN state on device 1 and diverge silently from the next round on.
+    if ((replay_records_ == nullptr) != (tp_->replay_records == nullptr)) {
+        throw std::logic_error("tensor-parallel replay-record bindings disagree between ranks");
+    }
+    return tp_->replay_records;
 }
 
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
@@ -383,7 +471,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
     ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, rope_frequency_[0], s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -533,7 +621,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
-        ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
+        ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, rope_frequency_[0],
+                  s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
         ops::causal_softmax_attention_cached(qn, last_position,
@@ -846,7 +935,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, rope_frequency_[0], s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -1339,6 +1428,10 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     const TextPrefill text_prefill{full_ids, begin};
+    if (tp2()) {
+        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), text_prefill,
+                                finalize_at_end);
+    }
     NullTap tap;
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
                         finalize_at_end);
@@ -1351,6 +1444,9 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
+    if (tp2()) {
+        throw std::logic_error("DFlash prefill has no tensor-parallel path in this build");
+    }
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
@@ -1362,6 +1458,9 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
+    }
+    if (tp2()) {
+        throw std::logic_error("multimodal prefill has no tensor-parallel path in this build");
     }
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
