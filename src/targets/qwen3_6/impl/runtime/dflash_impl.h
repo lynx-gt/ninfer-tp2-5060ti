@@ -540,6 +540,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .kv_table_rows           = text_rows,
                     .state_source_slots      = state_sources,
                     .state_destination_slots = state_destinations,
+                    .lanes                   = active_lanes,
                     .target_hidden           = target_hidden,
                     .target_logits           = target_logits,
                     .target_tokens           = target_tokens,

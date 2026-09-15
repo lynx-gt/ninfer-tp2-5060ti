@@ -195,6 +195,10 @@ struct TargetVerifyFrameView {
     Tensor rope_positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
+    // 上游 master 的 DFlash2 用状态槽（source/destination）驱动 SSM 状态交接；
+    // 本 fork 的验证路径按 lane 索引做 scatter，两者在 DFlash2 的调用点同时给出。
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
     Tensor lanes;
     Tensor target_hidden;
     Tensor target_logits;
