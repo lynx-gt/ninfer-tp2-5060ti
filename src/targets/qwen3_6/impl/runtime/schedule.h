@@ -184,8 +184,8 @@ struct MtpGqaEnvelopes {
 };
 
 struct DFlashEnvelopes {
-    ops::SwaContextExecutionEnvelope local;
-    ops::GqaContextExecutionEnvelope full;
+    ops::SlidingWindowAttentionExecutionEnvelope local;
+    ops::ContextAttentionExecutionEnvelope full;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
