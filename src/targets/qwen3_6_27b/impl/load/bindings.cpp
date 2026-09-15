@@ -619,6 +619,11 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return {};
     }
 
+    // DFlash2 草稿（`dflash2/**`）在两卡上复制运行：本 fork 的残差/隐藏态在两张卡上逐位相同，
+    // 因此草稿可以各自独立算出同一批提案，不需要分片，也不需要词表切分 + 跨卡 gather。
+    // 代价是草稿权重（约 2.07 GiB）每卡一份。上游 master 没有 TP，故此处是本 fork 自己的决定。
+    if (object.starts_with("dflash2/")) { return {}; }
+
     // GDN depthwise conv1d weight: channel-split, NOT replicated.
     //
     // Artifact shape is [4, 10240]: 4 taps x convolution_dim channels, i.e. the CHANNEL axis is
