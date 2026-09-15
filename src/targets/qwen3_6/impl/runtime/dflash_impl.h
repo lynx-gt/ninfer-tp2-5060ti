@@ -520,6 +520,33 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
 
+        // ---- DFlash2 tp2：草稿由 rank 0 产出后拷给 rank 1，两卡各自验证自己那半 target ----
+        std::optional<TpExecution> tp = tp_execution(state.execution);
+        if (tp) {
+            if (!tp->io->dflash_decode.has_value()) {
+                throw std::logic_error("tensor-parallel DFlash2 decode requires a peer frame");
+            }
+            qwen3_6::DFlashDecodeState& peer_frame = *tp->io->dflash_decode;
+            // rank 1 用同一份 ingress 记录（DFlash2 的验证默认 greedy，不读 token_counts 指针）
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            CUDA_CHECK(cudaMemcpyAsync(peer_frame.ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress),
+                                       cudaMemcpyHostToDevice, tp->device->stream));
+            // 草稿是 rank 0 那套模型算出来的；两卡位置/嵌入相同，所以按构造就是同一批提案
+            CUDA_CHECK(cudaMemcpyAsync(peer_frame.draft_tokens.data, frame.draft_tokens.data,
+                                       frame.draft_tokens.bytes(), cudaMemcpyDeviceToDevice,
+                                       tp->device->stream));
+            Tensor p_anchors   = peer_frame.anchors.slice(0, 0, batch_size);
+            Tensor p_frontiers = peer_frame.execution_frontiers.slice(0, 0, batch_size);
+            Tensor p_extents   = peer_frame.proposal_extents.slice(0, 0, batch_size);
+            Tensor p_drafts    = peer_frame.draft_tokens.slice(1, 0, batch_size);
+            Tensor p_verify    = peer_frame.verify_ids.slice(1, 0, batch_size);
+            Tensor p_positions = peer_frame.verify_positions.slice(1, 0, batch_size);
+            ops::speculative_prepare_verify_inputs(p_anchors, p_drafts, p_frontiers, p_extents,
+                                                   p_verify, p_positions, tp->device->stream);
+            CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+        }
+
         // 本 fork 的 TextContext 多两个参数：per-rank 的 rope 频率表与 tp 执行上下文。
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
@@ -530,9 +557,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);
-            target_verify_accept(
-                state.execution, state.continuation_hidden_store, card,
-                TargetVerifyFrameView{
+            TargetVerifyFrameView rank0_frame{
                     .ids                     = verify_ids,
                     .cache_positions         = target_positions,
                     .rope_positions          = target_rope,
@@ -560,8 +585,44 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .replay_records  = state.execution.replay_records,
                     .sampling        = frame.sampling,
                     .feature_sink    = &sink,
-                },
-                target_envelope);
+            };
+            if (tp) {
+                qwen3_6::DFlashDecodeState& pf = *tp->io->dflash_decode;
+                TargetVerifyFrameView peer_frame_view{
+                    .ids             = pf.verify_ids.slice(1, 0, batch_size),
+                    .cache_positions = pf.verify_positions.slice(1, 0, batch_size),
+                    .rope_positions  = pf.target_rope_positions.slice(1, 0, batch_size),
+                    .valid_columns   = pf.target_valid_columns.slice(0, 0, batch_size),
+                    .kv_table_rows   = pf.text_kv_table_rows.slice(0, 0, batch_size),
+                    .state_source_slots = pf.state_source_slots.slice(0, 0, batch_size),
+                    .state_destination_slots = pf.state_destination_slots.slice(0, 0, batch_size),
+                    .lanes           = pf.active_lanes.slice(0, 0, batch_size),
+                    .target_hidden   = pf.target_hidden.slice(2, 0, batch_size),
+                    .target_logits   = pf.target_logits.slice(2, 0, batch_size),
+                    .target_tokens   = pf.target_argmax.slice(1, 0, batch_size),
+                    .drafts          = pf.draft_tokens.slice(1, 0, batch_size),
+                    .current_extents = pf.proposal_extents.slice(0, 0, batch_size),
+                    .candidate_ids   = pf.candidate_ids.data
+                                                   ? pf.candidate_ids.slice(2, 0, batch_size)
+                                                   : Tensor{},
+                    .proposal_q =
+                        pf.proposal_q.data ? pf.proposal_q.slice(2, 0, batch_size) : Tensor{},
+                    .frontiers       = pf.execution_frontiers.slice(0, 0, batch_size),
+                    .anchors         = pf.anchors.slice(0, 0, batch_size),
+                    .licensed_tokens = pf.licensed_tokens.slice(1, 0, batch_size),
+                    .licensed_counts = pf.licensed_counts.slice(0, 0, batch_size),
+                    .accepted_drafts = pf.accepted_drafts.slice(0, 0, batch_size),
+                    .selected_hidden = pf.target_continuation_hidden.slice(1, 0, batch_size),
+                    .replay_records  = tp->replay_records,
+                    .sampling        = pf.sampling,
+                    .feature_sink    = nullptr,
+                };
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     rank0_frame, peer_frame_view, target_envelope);
+            } else {
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     rank0_frame, target_envelope);
+            }
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
