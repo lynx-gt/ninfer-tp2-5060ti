@@ -349,6 +349,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
+    std::fprintf(stderr, "[dbg] persistent.dflash=%d features.dflash=%d io.dflash_decode=%d\n",
+                 plan.persistent.dflash.has_value() ? 1 : 0,
+                 plan.features.dflash() ? 1 : 0, io.dflash_decode.has_value() ? 1 : 0);
     if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
