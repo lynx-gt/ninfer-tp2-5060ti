@@ -260,7 +260,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
-  ops/wrapper/vision_pos_embed.cpp)
+  ops/wrapper/vision_pos_embed.cpp
   # DFlash2 op 集（master 独有，随 dflash2 引擎整合移植）
   ops/attn_input_proj/w8/w8_dflash2_attn_input.cu
   ops/linear_swiglu/w8/w8_dflash2_linear_swiglu.cu
