@@ -22,6 +22,8 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
 }
 
+W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t);
+
 // tp1 表优先；未命中再查 tp2 shard 表；都不命中才报错。
 W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
