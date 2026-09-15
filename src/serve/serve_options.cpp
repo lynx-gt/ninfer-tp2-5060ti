@@ -62,6 +62,51 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+
+RopeMode parse_rope_mode(const char* text) {
+    const std::string value(text);
+    if (value == "native") { return RopeMode::Native; }
+    if (value == "yarn") { return RopeMode::Yarn; }
+    throw std::invalid_argument("invalid rope: " + value + " (expected native|yarn)");
+}
+
+double parse_yarn_factor(const char* text) {
+    errno              = 0;
+    char* end          = nullptr;
+    const double value = std::strtod(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' || !(value >= 1.0) || !(value <= 64.0)) {
+        throw std::invalid_argument(std::string("invalid yarn-factor: ") + text);
+    }
+    return value;
+}
+
+int parse_tp(const char* text) {
+    const int value = parse_nonnegative_int(text, "tp");
+    if (value != 1 && value != 2) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    }
+    return value;
+}
+
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> result;
+    const std::string_view view(text);
+    std::size_t start = 0;
+    while (start <= view.size()) {
+        const std::size_t comma = view.find(',', start);
+        const std::string_view token =
+            comma == std::string_view::npos ? view.substr(start) : view.substr(start, comma - start);
+        if (token.empty()) { throw std::invalid_argument(std::string("invalid devices: ") + text); }
+        result.push_back(parse_nonnegative_int(std::string(token).c_str(), "devices"));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (result.empty() || result.size() > 2) {
+        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    }
+    return result;
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -259,6 +304,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--tp") {
+            options.tp = parse_tp(require_value("--tp"));
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(require_value("--devices"));
+        } else if (arg == "--rope") {
+            options.rope_mode = parse_rope_mode(require_value("--rope"));
+        } else if (arg == "--yarn-factor") {
+            options.yarn_factor = parse_yarn_factor(require_value("--yarn-factor"));
+        } else if (arg == "--yarn-origin") {
+            options.yarn_origin = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--yarn-origin"), "yarn-origin"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -357,6 +413,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.devices.empty()) {
+        if (options.tp == 2) {
+            throw std::invalid_argument("--tp 2 requires --devices to name two devices");
+        }
+        options.devices = {options.device};
+    }
+    if (static_cast<int>(options.devices.size()) != options.tp) {
+        throw std::invalid_argument("--devices must list exactly one id per tp rank");
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
