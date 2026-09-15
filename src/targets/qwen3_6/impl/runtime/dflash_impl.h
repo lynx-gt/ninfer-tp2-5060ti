@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -510,6 +511,14 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
             DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
+        std::fprintf(stderr, "[dbg] pending=%d,%d,%d,%d local=%d,%d,%d,%d\n",
+                     dflash_state(state).pending_features.ne[0],
+                     dflash_state(state).pending_features.ne[1],
+                     dflash_state(state).pending_features.ne[2],
+                     dflash_state(state).pending_features.ne[3],
+                     dflash_state(state).local.layer_count(),
+                     dflash_state(state).local.capacity(),
+                     dflash_state(state).local.lane_capacity(), width);
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
