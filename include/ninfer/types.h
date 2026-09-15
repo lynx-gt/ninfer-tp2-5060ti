@@ -162,6 +162,10 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+struct LoadProgress {
+    std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
@@ -198,6 +202,7 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    LoadProgress load_progress;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

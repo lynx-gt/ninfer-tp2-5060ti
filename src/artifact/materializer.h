@@ -3,15 +3,20 @@
 #include "artifact/binder.h"
 #include "core/arena.h"
 #include "core/device.h"
-#include "ninfer/types.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::artifact {
+
+struct LoadProgress {
+    std::function<void(std::string_view, std::uint64_t, std::uint64_t)> callback;
+};
 
 struct MaterializationStats {
     std::uint64_t file_bytes              = 0;
@@ -55,7 +60,7 @@ public:
 
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
-                                            DeviceContext&, const StartupObserver*);
+                                            std::span<DeviceContext* const>, LoadProgress*);
 
     struct ObjectStorage {
         std::array<void*, kMaximumDevices> device{};
@@ -79,7 +84,6 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
 
 // Single-device call form for the tp1 path; requires plan.device_count == 1.
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device,
-                                 const StartupObserver* startup_observer = nullptr);
+                                 DeviceContext& device, LoadProgress* progress = nullptr);
 
 } // namespace ninfer::artifact

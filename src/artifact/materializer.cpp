@@ -1,7 +1,5 @@
 #include "artifact/materializer.h"
 
-#include "core/startup.h"
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -132,16 +130,12 @@ DeviceArena& MaterializedArtifact::device_arena(int device) {
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device, const StartupObserver* startup_observer) {
-    const StartupObserver no_startup_observer;
-    const StartupObserver& startup =
-        startup_observer == nullptr ? no_startup_observer : *startup_observer;
-    std::uint64_t total = 0;
-    for (const DeviceMaterialization& placement : plan.device_objects) {
-        total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
+                                 std::span<DeviceContext* const> devices, LoadProgress* progress) {
+    const int device_count = plan.device_count;
+    if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices) ||
+        devices.size() < static_cast<std::size_t>(device_count)) {
+        throw ArtifactError("materialization plan and execution context disagree on device count");
     }
-    StartupPhaseScope materialize_phase(startup, StartupPhase::WeightsMaterialize,
-                                        StartupProgressUnit::Bytes, total);
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
     out.stats_.device_count = device_count;
@@ -195,6 +189,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     ranges.reserve(range_count);
     std::uint64_t copied         = 0;
     std::uint64_t last_published = 0;
+    std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         const auto slot           = static_cast<std::size_t>(placement.device);
@@ -209,13 +204,36 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (actual_offset != placement.offset) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
-        out.objects_.at(placement.object.index).device = storage.data;
-        ranges.push_back(CopyRange{
-            .source_begin = payload.absolute_offset,
-            .source_end   = checked_add(payload.absolute_offset, placement.bytes,
-                                        "artifact tensor source range overflows u64"),
-            .destination  = static_cast<std::byte*>(storage.data),
-        });
+        out.objects_.at(placement.object.index).device[slot]       = storage.data;
+        out.objects_.at(placement.object.index).device_bytes[slot] = placement.bytes;
+        auto* const base                                     = static_cast<std::byte*>(storage.data);
+        const auto add_range = [&](std::uint64_t source_offset, std::uint64_t dest_offset,
+                                   std::uint64_t bytes) {
+            if (source_offset > payload.data.size() ||
+                payload.data.size() - source_offset < bytes || dest_offset > placement.bytes ||
+                placement.bytes - dest_offset < bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            ranges.push_back(CopyRange{
+                .source_begin = checked_add(payload.absolute_offset, source_offset,
+                                            "artifact tensor source range overflows u64"),
+                .source_end   = checked_add(payload.absolute_offset + source_offset, bytes,
+                                            "artifact tensor source range overflows u64"),
+                .destination  = base + dest_offset,
+                .device       = placement.device,
+            });
+            total = checked_add(total, bytes, "artifact tensor byte count overflows u64");
+        };
+        if (placement.copies.empty()) {
+            if (payload.data.size() != placement.bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            add_range(0, 0, placement.bytes);
+        } else {
+            for (const PlaneCopy& copy : placement.copies) {
+                add_range(copy.source_offset, copy.dest_offset, copy.bytes);
+            }
+        }
     }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
     // Destination ranges must stay disjoint *within* a device. The single-device path used to get
@@ -273,20 +291,16 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         std::min<std::uint64_t>(kMaximumSlotCount, 1 + (aligned_read_bytes - 1) / slot_bytes));
     std::vector<std::unique_ptr<Slot>> slots;
     slots.reserve(slot_count);
-    const std::uint64_t staging_bytes = static_cast<std::uint64_t>(slot_bytes) * slot_count;
-    StartupPhaseScope staging_phase(startup, StartupPhase::WeightsStagingPin,
-                                    StartupProgressUnit::Bytes, staging_bytes);
     for (std::size_t i = 0; i < slot_count; ++i) {
         slots.push_back(std::make_unique<Slot>(slot_bytes, devices.first(
                                                                static_cast<std::size_t>(device_count))));
     }
-    staging_phase.complete(staging_bytes, staging_bytes);
-    out.stats_.peak_staging_bytes = staging_bytes;
-    materialize_phase.progress(0, total);
+    out.stats_.peak_staging_bytes = static_cast<std::uint64_t>(slot_bytes) * slot_count;
 
-    std::size_t next_slot  = 0;
-    std::size_t next_range = 0;
-    const auto start       = std::chrono::steady_clock::now();
+    std::size_t next_slot        = 0;
+    std::size_t first_unfinished = 0;
+    const auto start             = std::chrono::steady_clock::now();
+    if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
     for (const ReadSpan& span : read_spans) {
         for (std::uint64_t source = span.begin; source < span.end; source += slot_bytes) {
             Slot& slot = *slots[next_slot++ % slot_count];
@@ -336,7 +350,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                             static_cast<std::size_t>(copy_begin - range.source_begin),
                         static_cast<std::byte*>(slot.buffer.data()) +
                             static_cast<std::size_t>(copy_begin - source),
-                        amount, cudaMemcpyHostToDevice, device.transfer_stream));
+                        amount, cudaMemcpyHostToDevice, devices[device_slot]->load_stream));
                     copied =
                         checked_add(copied, amount, "artifact copied byte count overflows u64");
                     out.stats_.per_device_h2d_bytes[device_slot] += amount;
@@ -348,26 +362,28 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     slot.pending[device_slot] = true;
                 }
             }
-            next_range = range_index;
-            CUDA_CHECK(cudaEventRecord(slot.event, device.transfer_stream));
-            slot.pending = true;
 
-            if (copied != last_published && copied < total) {
+            if (progress != nullptr && progress->callback && copied != last_published &&
+                copied < total) {
                 last_published = copied;
-                materialize_phase.progress(copied, total);
+                progress->callback("weights", copied, total);
             }
         }
     }
     for (const auto& slot : slots) { slot->wait(); }
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    if (copied != total || next_range != ranges.size()) {
+    for (int index = 0; index < device_count; ++index) {
+        CUDA_CHECK(cudaStreamSynchronize(devices[static_cast<std::size_t>(index)]->load_stream));
+    }
+    // Leave the caller on the primary device: the copy loop above walked the device list, and the
+    // rest of the load path assumes the current device is still the one it set before calling.
+    if (device_count > 1) { CUDA_CHECK(cudaSetDevice(devices[0]->device)); }
+    if (copied != total) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    slots.clear();
-    materialize_phase.complete(copied, total);
+    if (progress != nullptr && progress->callback) { progress->callback("weights", copied, total); }
     return out;
 }
 
