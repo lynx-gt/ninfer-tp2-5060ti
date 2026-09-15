@@ -1,5 +1,7 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 
+#include <cstdio>
+
 #include "ops/launcher/prepare_ragged_prefix.h"
 
 #include <cstdint>
@@ -24,6 +26,15 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
         positions.ne[1] != batch || positions.ne[2] != 1 || positions.ne[3] != 1 ||
         !vector_shape(lanes) || !vector_shape(starts) || !vector_shape(ends) ||
         !vector_shape(counts)) {
+        std::fprintf(stderr,
+                     "[dbg] ragged: src=%d,%d,%d,%d dest=%d,%d,%d,%d pos=%d,%d,%d,%d "
+                     "lanes=%d,%d starts=%d,%d ends=%d,%d counts=%d,%d
+",
+                     source.ne[0], source.ne[1], source.ne[2], source.ne[3], destination.ne[0],
+                     destination.ne[1], destination.ne[2], destination.ne[3], positions.ne[0],
+                     positions.ne[1], positions.ne[2], positions.ne[3], lanes.ne[0], lanes.ne[1],
+                     starts.ne[0], starts.ne[1], ends.ne[0], ends.ne[1], counts.ne[0],
+                     counts.ne[1]);
         throw std::invalid_argument("prepare_ragged_prefix: invalid tensor geometry");
     }
     if (source.data == nullptr || destination.data == nullptr || !destination.is_contiguous() ||
