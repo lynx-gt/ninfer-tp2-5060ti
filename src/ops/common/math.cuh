@@ -42,4 +42,23 @@ __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
     return load_vec<__half2>(&bits);
 }
 
+
+}
+
+__device__ __forceinline__ int4 bf16x8_bits_to_f16x8_bits(int4 bits) {
+    return make_int4(
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.x))),
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.y))),
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.z))),
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.w))));
+}
+
+
+}
+
+__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
+    const __half2 packed = __floats2half2_rn(lo, hi);
+    return load_vec<std::uint32_t>(&packed);
+}
+
 } // namespace ninfer::ops
