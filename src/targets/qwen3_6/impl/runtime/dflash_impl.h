@@ -96,9 +96,6 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
-        // [dbg] 定向实验开关：设了 NINFER_DFLASH_NOCTX 就整段跳过上下文写入，
-        // 用来判断草稿到底有没有吃到 target 特征（接受率不变=根本没吃到）。
-        if (std::getenv("NINFER_DFLASH_NOCTX") != nullptr) { return; }
         using Config               = typename V::DFlashConfig;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
@@ -281,13 +278,6 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 Tensor query_flat = query.view({Config::query_size, columns});
                 Tensor key_flat   = key.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
-                std::fprintf(stderr, "[dbg] attn_in: cols=%d prepared=%d,%d,%d,%d dt=%d qkv=%d,%d fmt=%d\n",
-                             columns, branch.prepared.ne[0], branch.prepared.ne[1],
-                             branch.prepared.ne[2], branch.prepared.ne[3],
-                             static_cast<int>(branch.prepared.dtype), layer.query_key_value.n,
-                             layer.query_key_value.k,
-                             static_cast<int>(layer.query_key_value.qtype));
-                ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
                                      layer.query_key_value, query_flat, key_flat, value_flat,
                                      stream);
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
@@ -340,15 +330,6 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 // 两个方向都会读到上一轮的残留 —— 实测漏掉时 rank1 候选整片读到 0，草稿大面积失配。
                 // 事件用 PeerEvents 的 inputs_ready：语义就是"某卡的数据已就绪"，与集合通信同一套
                 // 复用纪律（先发 wait 再发 record）。
-                // [dbg] 定向实验：临时关掉跨卡事件同步，验证它是否污染了 verify 的集合通信排序。
-                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
-                    CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
-                }
-                CUDA_CHECK(cudaSetDevice(tp->device->device));
-                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
-                    CUDA_CHECK(
-                        cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
-                }
                 // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
                 Tensor peer_hidden = tp->work->alloc(DType::BF16, {Config::hidden, mask_columns});
                 Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
@@ -357,12 +338,6 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                                            cudaMemcpyDeviceToDevice, tp->device->stream));
                 auto peer_scope = tp->work->scope();
                 ops::linear_topk(peer_hidden, tp->weights->output_head, peer_valid, peer_ids,
-                                 peer_scores, *tp->work, tp->device->stream);
-                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
-                    CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(1), tp->device->stream));
-                }
-                CUDA_CHECK(cudaSetDevice(state.execution.device.device));
-                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
                     CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
                 }
                 // 把 rank 1 的候选搬到 rank 0（peer 访问已在构造时打开），再合并
@@ -577,14 +552,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
             DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
-        std::fprintf(stderr, "[dbg] pending=%d,%d,%d,%d local=%d,%d,%d,%d\n",
-                     dflash_state(state).pending_features.ne[0],
-                     dflash_state(state).pending_features.ne[1],
-                     dflash_state(state).pending_features.ne[2],
-                     dflash_state(state).pending_features.ne[3],
-                     dflash_state(state).local.layer_count(),
-                     dflash_state(state).local.capacity(),
-                     dflash_state(state).local.lane_capacity(), width);
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);

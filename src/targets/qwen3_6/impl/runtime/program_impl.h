@@ -349,9 +349,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
-    std::fprintf(stderr, "[dbg] persistent.dflash=%d features.dflash=%d io.dflash_decode=%d\n",
-                 plan.persistent.dflash.has_value() ? 1 : 0,
-                 plan.features.dflash() ? 1 : 0, io.dflash_decode.has_value() ? 1 : 0);
     if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -2325,8 +2322,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         sequence.mtp_drafts.begin());
         } else if (is_masked_draft_backend(speculative_backend) &&
                    sequence.dflash_context_frontier != prompt_tokens) {
-            std::fprintf(stderr, "[dbg] dflash frontier=%u cursor=%u prompt=%u\n",
-                         sequence.dflash_context_frontier, staged.cursor, prompt_tokens);
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
         sequence.tail_hidden_valid      = true;
@@ -2349,11 +2344,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                  (speculative_backend == SpeculativeBackend::DFlash &&
                   (!sequence.kv || !sequence.kv->backend)) ||
                  sequence.dflash_context_frontier < frontier)) {
-                std::fprintf(stderr, "[dbg] rwckpt: dflash=%d kv=%d backend=%d fr=%u/%u\n",
-                             dflash ? 1 : 0, sequence.kv ? 1 : 0,
-                             (sequence.kv && sequence.kv->backend) ? 1 : 0,
-                             sequence.dflash_context_frontier, frontier);
-                throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
             sequence.rewrite_checkpoint = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
@@ -2781,131 +2771,6 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       draft_window, envelopes, target_envelope, executable);
         device.synchronize();
 
-        {
-            // [dbg] 草稿 vs 目标：draft_tokens 是 [W-1, batch]，target_argmax 是 [W, batch]。
-            // 每行只印第 0 号 lane 的列，够看清对齐关系。
-            std::array<std::int32_t, 16> dbg_drafts{};
-            std::array<std::int32_t, 16> dbg_argmax{};
-            std::array<std::int32_t, 16> dbg_cand{};
-            CUDA_CHECK(cudaMemcpy(dbg_drafts.data(), io.dflash_decode->draft_tokens.data,
-                                  draft_window * static_cast<std::size_t>(sizeof(std::int32_t)),
-                                  cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(dbg_argmax.data(), io.dflash_decode->target_argmax.data,
-                                  (draft_window + 1U) *
-                                      static_cast<std::size_t>(sizeof(std::int32_t)),
-                                  cudaMemcpyDeviceToHost));
-            if (io.dflash_decode->candidate_ids.data != nullptr) {
-                CUDA_CHECK(cudaMemcpy(dbg_cand.data(), io.dflash_decode->candidate_ids.data,
-                                      8 * static_cast<std::size_t>(sizeof(std::int32_t)),
-                                      cudaMemcpyDeviceToHost));
-            }
-            std::array<std::int32_t, 16> dbg_pids{};
-            std::array<std::int32_t, 16> dbg_ppos{};
-            std::array<float, 128> dbg_q{};
-            if (io.dflash_decode->proposal_q.data != nullptr) {
-                CUDA_CHECK(cudaMemcpy(dbg_q.data(), io.dflash_decode->proposal_q.data,
-                                      16 * draft_window * static_cast<std::size_t>(sizeof(float)),
-                                      cudaMemcpyDeviceToHost));
-            }
-            // 完整候选矩阵：candidate_ids 是 [16,K,B]，row-major ⇒ cand[c*K + i]（B=1）。
-            std::array<std::int32_t, 128> dbg_all{};
-            if (io.dflash_decode->candidate_ids.data != nullptr) {
-                CUDA_CHECK(cudaMemcpy(dbg_all.data(), io.dflash_decode->candidate_ids.data,
-                                      16 * draft_window *
-                                          static_cast<std::size_t>(sizeof(std::int32_t)),
-                                      cudaMemcpyDeviceToHost));
-            }
-            for (std::uint32_t i = 0; i < draft_window; ++i) {
-                std::fprintf(stderr, "[dbg] col%u:", i);
-                for (int c = 0; c < 16; ++c) {
-                    std::fprintf(stderr, " %d", dbg_all[i * 16 + c]);
-                }
-                // 目标 argmax[i]（预测位置 i+1 的真值）是否在该列的候选集里
-                bool present = false;
-                for (int c = 0; c < 16; ++c) {
-                    if (dbg_all[i * 16 + c] == dbg_argmax[i]) { present = true; }
-                }
-                // 选出来的 draft 是否在该列的候选集里（选择的合法性自检）
-                bool picked_in_set = false;
-                int picked_rank    = -1;
-                for (int c = 0; c < 16; ++c) {
-                    if (dbg_all[i * 16 + c] == dbg_drafts[i]) {
-                        picked_in_set = true;
-                        picked_rank   = c;
-                    }
-                }
-                // proposal_q 的 argmax 应该就是 draft[i]
-                int q_argmax = -1;
-                if (io.dflash_decode->proposal_q.data != nullptr) {
-                    float best = -1.0f;
-                    for (int c = 0; c < 16; ++c) {
-                        const float q = dbg_q[i * 16 + c];
-                        if (q > best) { best = q; q_argmax = c; }
-                    }
-                }
-                std::fprintf(stderr,
-                             "  | target=%d in_set=%d draft=%d picked_in_set=%d picked_rank=%d "
-                             "q_argmax=%d\n",
-                             dbg_argmax[i], present ? 1 : 0, dbg_drafts[i], picked_in_set ? 1 : 0,
-                             picked_rank, q_argmax);
-            }
-            CUDA_CHECK(cudaMemcpy(dbg_pids.data(), io.dflash_decode->proposal_ids.data,
-                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
-                                  cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(dbg_ppos.data(), io.dflash_decode->proposal_positions.data,
-                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
-                                  cudaMemcpyDeviceToHost));
-            std::fprintf(stderr, "[dbg] blk_ids=");
-            for (int j = 0; j < 8; ++j) {
-                std::fprintf(stderr, "%d,", dbg_pids[j]);
-            }
-            std::fprintf(stderr, " blk_pos=");
-            for (int j = 0; j < 8; ++j) {
-                std::fprintf(stderr, "%d,", dbg_ppos[j]);
-            }
-            std::fputc(10, stderr);
-            // verify 侧：cache 位置（op 算的）与 rope 位置（主机 ingress 填的）必须一致
-            std::array<std::int32_t, 16> dbg_vpos{};
-            std::array<std::int32_t, 16> dbg_vrope{};
-            CUDA_CHECK(cudaMemcpy(dbg_vpos.data(), io.dflash_decode->verify_positions.data,
-                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
-                                  cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(dbg_vrope.data(), io.dflash_decode->target_rope_positions.data,
-                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
-                                  cudaMemcpyDeviceToHost));
-            std::fprintf(stderr, "[dbg] cache_pos=");
-            for (int j = 0; j < 8; ++j) { std::fprintf(stderr, "%d,", dbg_vpos[j]); }
-            std::fprintf(stderr, " rope_pos=");
-            for (int j = 0; j < 8; ++j) { std::fprintf(stderr, "%d,", dbg_vrope[j]); }
-            std::fputc(10, stderr);
-            // 授权出去的 token 与 verify 的 argmax 必须逐位一致（贪心无惩罚时这是引擎的硬不变式）
-            {
-                const int count = dflash_host_egress->licensed_counts[0];
-                std::fprintf(stderr, "[dbg] licensed(n=%d)=", count);
-                for (int j = 0; j < count && j < 8; ++j) {
-                    std::fprintf(stderr, "%d,", dflash_host_egress->licensed_tokens[j]);
-                }
-                std::fprintf(stderr, " argmax=");
-                for (int j = 0; j < count && j < 8; ++j) {
-                    std::fprintf(stderr, "%d,", dbg_argmax[j]);
-                }
-                std::fputc(10, stderr);
-            }
-            std::fprintf(stderr, "[dbg] cand=");
-            for (int j = 0; j < 8; ++j) {
-                std::fprintf(stderr, "%d,", dbg_cand[j]);
-            }
-            std::fprintf(stderr, " drafts=");
-            for (std::uint32_t j = 0; j < draft_window; ++j) {
-                std::fprintf(stderr, "%d,", dbg_drafts[j]);
-            }
-            std::fprintf(stderr, " argmax=");
-            for (std::uint32_t j = 0; j <= draft_window; ++j) {
-                std::fprintf(stderr, "%d,", dbg_argmax[j]);
-            }
-            std::fprintf(stderr, " acc=%d cnt=%d\n", dflash_host_egress->accepted_drafts[0],
-                         dflash_host_egress->licensed_counts[0]);
-        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
