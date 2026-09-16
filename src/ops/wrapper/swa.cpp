@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <cstdio>
 
 namespace ninfer::ops {
 namespace {
@@ -133,6 +134,18 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
         throw std::invalid_argument("swa: scale must be 1/sqrt(128)");
     }
 
+    // [dbg] 临时：读侧运行期上下文参数（host 侧，capture 安全）
+    {
+        static int dbg_swa = 0;
+        if (dbg_swa < 4) {
+            ++dbg_swa;
+            std::fprintf(stderr,
+                         "[dbg] swa %d: cap=%u padded=%u lanes=%d head_dim=%d env=[%u,%u]\n",
+                         dbg_swa, context.capacity, context.padded_capacity,
+                         context.lane_capacity, context.head_dim, envelope.min_context,
+                         envelope.max_context);
+        }
+    }
     auto scope               = workspace.scope();
     const auto plan          = detail::swa_resolve_plan(tokens, envelope);
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);

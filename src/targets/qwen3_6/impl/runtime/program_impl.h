@@ -2787,7 +2787,21 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 for (std::size_t i = 0; i < drafts.size(); ++i) {
                     std::fprintf(stderr, " %d", drafts[i]);
                 }
-                std::fprintf(stderr, "\n");
+                std::fprintf(stderr, "\n");                {
+                    std::int32_t pos0 = -1, val0 = -1, slot0 = -1, anch0 = -1;
+                    CUDA_CHECK(cudaMemcpy(&pos0, io.dflash_decode->proposal_positions.data, 4,
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(&val0, io.dflash_decode->proposal_valid_columns.data, 4,
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(&slot0, io.dflash_decode->state_destination_slots.data, 4,
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(&anch0, io.dflash_decode->anchors.data, 4,
+                                          cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr,
+                                 "[dbg] round %d args: pos0=%d valid0=%d slot0=%d anchor=%d\n",
+                                 dbg_round, pos0, val0, slot0, anch0);
+                }
+
             }
         }
 
