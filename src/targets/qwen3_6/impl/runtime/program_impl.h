@@ -2864,6 +2864,20 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 std::fprintf(stderr, "%d,", dbg_ppos[j]);
             }
             std::fputc(10, stderr);
+            // verify 侧：cache 位置（op 算的）与 rope 位置（主机 ingress 填的）必须一致
+            std::array<std::int32_t, 16> dbg_vpos{};
+            std::array<std::int32_t, 16> dbg_vrope{};
+            CUDA_CHECK(cudaMemcpy(dbg_vpos.data(), io.dflash_decode->verify_positions.data,
+                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(dbg_vrope.data(), io.dflash_decode->target_rope_positions.data,
+                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
+                                  cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "[dbg] cache_pos=");
+            for (int j = 0; j < 8; ++j) { std::fprintf(stderr, "%d,", dbg_vpos[j]); }
+            std::fprintf(stderr, " rope_pos=");
+            for (int j = 0; j < 8; ++j) { std::fprintf(stderr, "%d,", dbg_vrope[j]); }
+            std::fputc(10, stderr);
             std::fprintf(stderr, "[dbg] cand=");
             for (int j = 0; j < 8; ++j) {
                 std::fprintf(stderr, "%d,", dbg_cand[j]);
