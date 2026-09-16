@@ -2320,6 +2320,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         sequence.mtp_drafts.begin());
         } else if (is_masked_draft_backend(speculative_backend) &&
                    sequence.dflash_context_frontier != prompt_tokens) {
+            std::fprintf(stderr, "[dbg] dflash frontier=%u cursor=%u prompt=%u\n",
+                         sequence.dflash_context_frontier, staged.cursor, prompt_tokens);
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
         sequence.tail_hidden_valid      = true;
