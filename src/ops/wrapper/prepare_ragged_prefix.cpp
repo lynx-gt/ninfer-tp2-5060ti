@@ -12,6 +12,7 @@ namespace ninfer::ops {
 void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tensor& starts,
                            const Tensor& ends, Tensor& destination, Tensor& positions,
                            Tensor& counts, cudaStream_t stream) {
+    std::fprintf(stderr,
     const std::int32_t width = source.ne[1];
     const std::int32_t batch = destination.ne[2];
     const auto vector_shape  = [batch](const Tensor& tensor) {
@@ -26,6 +27,7 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
         positions.ne[1] != batch || positions.ne[2] != 1 || positions.ne[3] != 1 ||
         !vector_shape(lanes) || !vector_shape(starts) || !vector_shape(ends) ||
         !vector_shape(counts)) {
+        std::fprintf(stderr,
         throw std::invalid_argument("prepare_ragged_prefix: invalid tensor geometry");
     }
     if (source.data == nullptr || destination.data == nullptr || !destination.is_contiguous() ||

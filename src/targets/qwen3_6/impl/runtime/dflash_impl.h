@@ -96,7 +96,6 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
-        using Config               = typename V::DFlashConfig;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
@@ -278,6 +277,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 Tensor query_flat = query.view({Config::query_size, columns});
                 Tensor key_flat   = key.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
+                ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
                                      layer.query_key_value, query_flat, key_flat, value_flat,
                                      stream);
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
@@ -325,11 +325,11 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         if (tp && state.execution.proposal_head == ProposalHead::Full) {
             const auto peer_valid = full_valid - local_valid;
             if (peer_valid > 0) {
-                // 跨卡这段是手工排的，没有集合通信帮忙排序，必须自己用事件把两条流串起来，
-                // 否则（1）rank1 拷 hidden 时 rank0 还没算完、（2）rank0 拷候选时 rank1 还没算完，
-                // 两个方向都会读到上一轮的残留 —— 实测漏掉时 rank1 候选整片读到 0，草稿大面积失配。
-                // 事件用 PeerEvents 的 inputs_ready：语义就是"某卡的数据已就绪"，与集合通信同一套
-                // 复用纪律（先发 wait 再发 record）。
+                CUDA_CHECK(cudaSetDevice(tp->device->device));
+                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
+                    CUDA_CHECK(
+                        cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
+                }
                 // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
                 Tensor peer_hidden = tp->work->alloc(DType::BF16, {Config::hidden, mask_columns});
                 Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
@@ -338,8 +338,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                                            cudaMemcpyDeviceToDevice, tp->device->stream));
                 auto peer_scope = tp->work->scope();
                 ops::linear_topk(peer_hidden, tp->weights->output_head, peer_valid, peer_ids,
-                    CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
-                }
+                                 peer_scores, *tp->work, tp->device->stream);
+                CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(1), tp->device->stream));
+                CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+                CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
                 // 把 rank 1 的候选搬到 rank 0（peer 访问已在构造时打开），再合并
                 Tensor remote_ids    = work.alloc(DType::I32, {16, mask_columns});
                 Tensor remote_scores = work.alloc(DType::FP32, {16, mask_columns});

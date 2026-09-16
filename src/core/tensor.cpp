@@ -104,6 +104,10 @@ Tensor Tensor::view(std::initializer_list<std::int32_t> shape) const {
 
     const auto normalized = normalize_shape(shape);
     if (shape_numel(normalized) != numel()) {
+        void* frames[16];
+        const int nframes = backtrace(frames, 16);
+        backtrace_symbols_fd(frames, nframes, 2);
+        throw std::invalid_argument("view element count mismatch");
     }
 
     return Tensor(data, dtype, shape);

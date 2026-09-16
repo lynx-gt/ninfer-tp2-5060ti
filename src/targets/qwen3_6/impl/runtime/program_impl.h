@@ -2344,6 +2344,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                  (speculative_backend == SpeculativeBackend::DFlash &&
                   (!sequence.kv || !sequence.kv->backend)) ||
                  sequence.dflash_context_frontier < frontier)) {
+                throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
             sequence.rewrite_checkpoint = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
@@ -2770,7 +2771,6 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
         device.synchronize();
-
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
