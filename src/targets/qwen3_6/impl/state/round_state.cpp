@@ -353,6 +353,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    // 上游 master 的 DFlash 状态里这三个也是必须绑定的（本 fork 合并时漏了）：
+    // verify_positions 是 I32 张量，candidate_ids / proposal_q 是可选区域。
+    verify_positions = layout.verify_positions.bind(backing);
+    if (layout.candidate_ids) { candidate_ids = layout.candidate_ids->bind(backing); }
+    if (layout.proposal_q) { proposal_q = layout.proposal_q->bind(backing); }
 }
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
