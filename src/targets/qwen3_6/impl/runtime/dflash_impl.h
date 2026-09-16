@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -22,6 +23,7 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/topk_pair_merge.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
@@ -313,12 +315,43 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
         Tensor ids_flat   = candidates.view({16, mask_columns});
         Tensor scores     = work.alloc(DType::FP32, {16, mask_columns});
+        // tp2：词表头按行分片（每卡 124160 行），草稿的候选选择必须取到**全局** top-16：
+        // 两卡各在自己那半词表上取 top-16，再把两路合并（分数降序、同分取更小 token id）。
+        const std::int32_t full_valid = TextConfig::token_domain;
+        const std::int32_t shard_rows = state.execution.model.output_head.n;
+        const std::int32_t local_valid = tp ? std::min(full_valid, shard_rows) : full_valid;
         if (state.execution.proposal_head == ProposalHead::Full) {
-            ops::linear_topk(hidden, state.execution.model.output_head, TextConfig::token_domain,
-                             ids_flat, scores, work, stream);
+            ops::linear_topk(hidden, state.execution.model.output_head, local_valid, ids_flat,
+                             scores, work, stream);
         } else {
             const auto& head = *state.execution.model.optimized_proposal;
             ops::linear_topk(hidden, head.head, head.token_ids, ids_flat, scores, work, stream);
+        }
+        if (tp && state.execution.proposal_head == ProposalHead::Full) {
+            const auto peer_valid = full_valid - local_valid;
+            if (peer_valid > 0) {
+                // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
+                CUDA_CHECK(cudaSetDevice(tp->device->device));
+                Tensor peer_hidden = tp->work->alloc(DType::BF16, {Config::hidden, mask_columns});
+                Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
+                Tensor peer_scores = tp->work->alloc(DType::FP32, {16, mask_columns});
+                CUDA_CHECK(cudaMemcpyAsync(peer_hidden.data, hidden.data, hidden.bytes(),
+                                           cudaMemcpyDeviceToDevice, tp->device->stream));
+                auto peer_scope = tp->work->scope();
+                ops::linear_topk(peer_hidden, tp->weights->output_head, peer_valid, peer_ids,
+                                 peer_scores, *tp->work, tp->device->stream);
+                CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+                // 把 rank 1 的候选搬到 rank 0（peer 访问已在构造时打开），再合并
+                Tensor remote_ids    = work.alloc(DType::I32, {16, mask_columns});
+                Tensor remote_scores = work.alloc(DType::FP32, {16, mask_columns});
+                CUDA_CHECK(cudaMemcpyAsync(remote_ids.data, peer_ids.data, remote_ids.bytes(),
+                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(remote_scores.data, peer_scores.data,
+                                           remote_scores.bytes(), cudaMemcpyDeviceToDevice,
+                                           stream));
+                ops::topk_pair_merge(ids_flat, scores, remote_ids, remote_scores, ids_flat, scores,
+                                     stream);
+            }
         }
         Tensor projected = work.alloc(DType::BF16, {256, mask_columns});
         ops::linear(hidden, weights.candidate_selector.hidden_projection, projected, stream);

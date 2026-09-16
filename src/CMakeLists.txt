@@ -261,6 +261,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp
+  ops/wrapper/topk_pair_merge.cpp
   ops/rmsnorm_rope/rmsnorm_rope.cpp
   ops/rmsnorm_rope/launch.cu
   ops/launcher/rmsnorm_pack_tail.cu

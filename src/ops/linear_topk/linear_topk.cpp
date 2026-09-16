@@ -38,8 +38,15 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (input_rows != detail::kLinearTopKHidden) {
         throw std::invalid_argument("linear_topk: unsupported head profile");
     }
+    // tp2 下词表头按行分片（整词表的一半）；profile 与整词表相同，valid_rows 由调用方按本卡给。
+    if (head_rows == detail::kLinearTopKFullRows / 2 && qtype == QType::W8G32_F16S) {
+        return HeadProfile::W8Full;
+    }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::W8G32_F16S) {
         return HeadProfile::W8Full;
+    }
+    if (head_rows == detail::kLinearTopKFullRows / 2 && qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        return HeadProfile::Fp8Full;
     }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return HeadProfile::Fp8Full;
