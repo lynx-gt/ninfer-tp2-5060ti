@@ -171,8 +171,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     if constexpr (Variant::supports_dflash) {
         // masked-draft 家族（35B DFlash 与 27B DFlash2）共用同一套 DFlash 持久状态布局。
+        // DFlash2 的 TP2 只切四个大 GEMM，滑窗 attention 在两卡上复制运行（swa 的 kernel 把
+        // 32Q/8KV 头写死），所以每卡的 local 滑窗 KV 仍是**全头**一份。
         if (plan.features.masked_draft()) {
-            // DFlash2 的 draft 权重按复制绑定（见 bindings.cpp 的 shard_mapping），TP2 下可用。
             if (tp != 1 && plan.speculative_backend != SpeculativeBackend::DFlash2) {
                 throw std::invalid_argument("DFlash has no tensor-parallel path in this build");
             }

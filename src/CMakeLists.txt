@@ -279,6 +279,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/dynamic_grouped_conv.cpp
   ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.cpp
   ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu
+  ops/dynamic_grouped_conv/tail/dynamic_grouped_conv_add_tail.cu
   ops/linear/w8/w8_feature.cu
   # DFlash2 op 集（master 独有，随 dflash2 引擎整合移植）
   ops/attn_input_proj/w8/w8_dflash2_attn_input.cu

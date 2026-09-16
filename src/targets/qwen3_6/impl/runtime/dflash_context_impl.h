@@ -12,6 +12,8 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (layout.full) { full.emplace(backing, *layout.full); }
+    // TP2 下每卡仍持有一份全头 local 滑窗 KV（草稿只切四个大 GEMM，attention 复制运行），
+    // 两卡各自的 cache 由各自的前传/物化路径写入，形状完全相同。
     if (local.layer_count() != DFlashConfig::local_layers ||
         local.capacity() != DFlashConfig::local_capacity ||
         local.num_kv_heads() != DFlashConfig::kv_heads ||

@@ -188,6 +188,40 @@ int main() {
         expect_plan(plan_for("mtp/layer/mlp/down", 2, config), expected, "mtp mlp down");
     }
 
+    // --- DFlash2 草稿层（本 fork 的 TP2 分片）：只切四个大 GEMM 中的三个 —— attention/output
+    // 行并行、gate_up 两段列切、mlp/down 行并行；qkv 投影与滑窗 attention 保持复制（swa 的
+    // bidirectional GQA kernel 把 32Q/8KV 头写死，且 qkv 只占草稿权重流量的 10%）。
+    //
+    // attention/output 的收缩维是 4096（草稿的 query_size），**不是**文本层的 6144：
+    // 通用 `ends("attention/output")` 规则在这里会给出错误的 3072/卡，本用例把 dflash2 自己的
+    // 2048/卡 钉死。 ---
+    {
+        const ShardPlan expected = {Shard{0, 0, 2048}, Shard{1, 2048, 2048}};
+        expect_plan(plan_for("dflash2/layers/0/attention/output", 2, config), expected,
+                   "dflash2 o_proj");
+    }
+    {
+        const ShardPlan expected = concat(half_block(0, 17408), half_block(17408, 17408));
+        expect_plan(plan_for("dflash2/layers/0/mlp/gate_up", 2, config), expected,
+                   "dflash2 gate_up");
+        expect_plan(plan_for("dflash2/layers/0/mlp/down", 2, config),
+                   ShardPlan{Shard{0, 0, 8704}, Shard{1, 8704, 8704}}, "dflash2 down");
+    }
+    for (std::string_view object :
+         {"dflash2/layers/0/attention/query_key_value", "dflash2/layers/0/input_norm",
+          "dflash2/layers/0/post_attention_norm", "dflash2/layers/0/attention/query_norm",
+          "dflash2/layers/0/attention/key_norm", "dflash2/layers/0/attention_conv/base_kernel",
+          "dflash2/layers/0/attention_conv/kernel_projection",
+          "dflash2/layers/0/mlp_conv/base_kernel",
+          "dflash2/layers/0/mlp_conv/kernel_projection", "dflash2/feature_projection",
+          "dflash2/context_norm", "dflash2/final_norm",
+          "dflash2/candidate_selector/hidden_projection",
+          "dflash2/candidate_selector/predecessor_codebook",
+          "dflash2/candidate_selector/successor_codebook"}) {
+        expect_empty(plan_for(object, 2, config),
+                     std::string("dflash2 replicated ") + std::string(object));
+    }
+
     // --- token_embedding: replicated (NOT row-split, despite sharing output_head's shape). ---
     expect_empty(plan_for("text/token_embedding", 2, config), "token_embedding");
 

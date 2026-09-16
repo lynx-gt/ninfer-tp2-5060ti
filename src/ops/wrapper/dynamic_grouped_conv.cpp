@@ -2,6 +2,7 @@
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.h"
+#include "ops/dynamic_grouped_conv/tail/dynamic_grouped_conv_add_tail_kernels.h"
 
 #include <array>
 #include <cmath>
@@ -218,6 +219,49 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
 
     detail::w8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
                                                         finish_delta, residual, workspace, stream);
+}
+
+void dynamic_grouped_conv_add_tail(const Tensor& projected, const Tensor& base_kernel,
+                                   const Tensor& finish_delta, Tensor& residual,
+                                   cudaStream_t stream) {
+    const std::int32_t batch_size = residual.ne[2];
+    const std::int32_t width      = residual.ne[1];
+    if (width < 2 || width > 16) {
+        throw std::invalid_argument("dynamic grouped conv add tail: W must be in [2,16]");
+    }
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("dynamic grouped conv add tail: B must be in [1,8]");
+    }
+    require_tensor(projected, DType::BF16, kHidden, width * batch_size, 1, 1,
+                   "dynamic grouped conv add tail", "projected");
+    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1,
+                   "dynamic grouped conv add tail", "base_kernel");
+    require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size,
+                   "dynamic grouped conv add tail", "finish_delta");
+    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1,
+                   "dynamic grouped conv add tail", "residual");
+
+    const std::array<Range, 3> ranges{{
+        {projected.data, projected.bytes(), "projected"},
+        {base_kernel.data, base_kernel.bytes(), "base_kernel"},
+        {finish_delta.data, finish_delta.bytes(), "finish_delta"},
+    }};
+    for (std::size_t first = 0; first < ranges.size(); ++first) {
+        if (overlaps(ranges[first], Range{residual.data, residual.bytes(), "residual"})) {
+            throw std::invalid_argument(std::string("dynamic grouped conv add tail: ") +
+                                        ranges[first].label + " overlaps residual");
+        }
+        for (std::size_t second = first + 1; second < ranges.size(); ++second) {
+            if (overlaps(ranges[first], ranges[second])) {
+                throw std::invalid_argument(std::string("dynamic grouped conv add tail: ") +
+                                            ranges[first].label + " overlaps " +
+                                            ranges[second].label);
+            }
+        }
+    }
+
+    detail::dynamic_grouped_conv_add_tail_launch(projected, base_kernel, finish_delta, residual,
+                                                 stream);
 }
 
 } // namespace ninfer::ops

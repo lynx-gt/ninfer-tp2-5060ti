@@ -619,10 +619,34 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return {};
     }
 
-    // DFlash2 草稿（`dflash2/**`）在两卡上复制运行：本 fork 的残差/隐藏态在两张卡上逐位相同，
-    // 因此草稿可以各自独立算出同一批提案，不需要分片，也不需要词表切分 + 跨卡 gather。
-    // 代价是草稿权重（约 2.07 GiB）每卡一份。上游 master 没有 TP，故此处是本 fork 自己的决定。
-    if (object.starts_with("dflash2/")) { return {}; }
+    // DFlash2 草稿的 TP2 分片：**只切四个大 GEMM**，qkv 投影与滑窗 attention 保持在两卡上复制
+    // 运行。这是草稿 attention 的编译期几何决定的：swa 的 bidirectional GQA kernel 把
+    // 32 query 头 / 8 kv 头写死（src/ops/kernel/bidirectional_gqa_attention.cuh），而草稿权重
+    // 流量被 gate_up(189MB)+down(95MB) 两件主导 —— 切它们已经拿到 340→187MB/卡的收益，
+    // qkv(33MB) 留下的增量只有约 17MB/卡，不值得为它改 kernel 或动 KV 布局。
+    // 复制的 attention 在两卡上逐位相同（同一权重、同一 KV、确定性 kernel），因此行并的
+    // attention/output 两卡取到的是同一份张量的各自半段，收缩维切分成立。
+    // check_nvfp4_tile_alignment=false：dflash2 的对象全部是 W8G32_F16S（row-split-k128-v1）
+    // 或 BF16，永远不会是 blockscale-k16-m128x4-v1。
+    if (object.starts_with("dflash2/")) {
+        if (ends("attention/output")) {
+            append_row_parallel(plan, DFlashConfig::query_size, tp, DFlashConfig::query_heads,
+                                object);
+            return by_columns(std::move(plan));
+        }
+        if (ends("mlp/gate_up")) {
+            constexpr std::uint64_t half = DFlashConfig::intermediate;
+            append_column_block(plan, 0, half, tp, half, object, false);
+            append_column_block(plan, half, half, tp, half, object, false);
+            return by_rows(std::move(plan));
+        }
+        if (ends("mlp/down")) {
+            append_row_parallel(plan, DFlashConfig::intermediate, tp, DFlashConfig::intermediate,
+                                object);
+            return by_columns(std::move(plan));
+        }
+        return {};
+    }
 
     // GDN depthwise conv1d weight: channel-split, NOT replicated.
     //
@@ -1150,49 +1174,60 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         }
         const DFlash2Plan& source = *plan.dflash2;
         auto& dflash2             = runtime.dflash.emplace();
+        // TP2：草稿的 attention/output 与 mlp 两件按 shard_mapping 的 dflash2 规则分片
+        // （输出行并 4096 / gate_up 两段列切 / down 行并 17408），qkv 与滑窗 attention 保持复制。
+        // 形状必须与分片规则一一对应；device 实参选择本卡自己的那份（复制对象每卡一份，
+        // 分片对象每卡半张）。
         dflash2.feature_projection =
-            materialized_weight(backing, source.feature_projection, 5120, 25600);
+            materialized_weight(backing, source.feature_projection, 5120, 25600, device);
         dflash2.context_norm = artifact::materialized_tensor(backing, source.context_norm,
-                                                             NumericFormat::BF16, {5120});
+                                                             NumericFormat::BF16, {5120}, device);
         for (std::size_t layer = 0; layer < dflash2.layers.size(); ++layer) {
             const DFlash2LayerPlan& layer_source = source.layers[layer];
             qwen3_6::DFlash2LayerWeights& target = dflash2.layers[layer];
             target.input_norm = artifact::materialized_tensor(backing, layer_source.input_norm,
-                                                              NumericFormat::BF16, {5120});
+                                                              NumericFormat::BF16, {5120}, device);
             target.attention_conv.base_kernel =
                 artifact::materialized_tensor(backing, layer_source.attention_conv.base_kernel,
-                                              NumericFormat::BF16, {5120, 2, 2});
+                                              NumericFormat::BF16, {5120, 2, 2}, device);
             target.attention_conv.kernel_projection = materialized_weight(
-                backing, layer_source.attention_conv.kernel_projection, 1280, 5120);
+                backing, layer_source.attention_conv.kernel_projection, 1280, 5120, device);
             target.query_key_value =
-                materialized_weight(backing, layer_source.query_key_value, 6144, 5120);
+                materialized_weight(backing, layer_source.query_key_value, 6144, 5120, device);
             target.context_key   = row_view(target.query_key_value, 4096, 1024);
             target.context_value = row_view(target.query_key_value, 5120, 1024);
             target.query_norm    = artifact::materialized_tensor(backing, layer_source.query_norm,
-                                                                 NumericFormat::BF16, {128});
+                                                                 NumericFormat::BF16, {128}, device);
             target.key_norm      = artifact::materialized_tensor(backing, layer_source.key_norm,
-                                                                 NumericFormat::BF16, {128});
+                                                                 NumericFormat::BF16, {128}, device);
             target.attention_output =
-                materialized_weight(backing, layer_source.attention_output, 5120, 4096);
+                materialized_weight(backing, layer_source.attention_output, 5120,
+                                    DFlashConfig::query_size / tp, device);
             target.post_attention_norm = artifact::materialized_tensor(
-                backing, layer_source.post_attention_norm, NumericFormat::BF16, {5120});
+                backing, layer_source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.mlp_conv.base_kernel = artifact::materialized_tensor(
-                backing, layer_source.mlp_conv.base_kernel, NumericFormat::BF16, {5120, 2, 2});
+                backing, layer_source.mlp_conv.base_kernel, NumericFormat::BF16, {5120, 2, 2},
+                device);
             target.mlp_conv.kernel_projection =
-                materialized_weight(backing, layer_source.mlp_conv.kernel_projection, 1280, 5120);
-            target.gate_up = materialized_weight(backing, layer_source.gate_up, 34816, 5120);
-            target.down    = materialized_weight(backing, layer_source.down, 5120, 17408);
+                materialized_weight(backing, layer_source.mlp_conv.kernel_projection, 1280, 5120,
+                                    device);
+            target.gate_up = materialized_weight(backing, layer_source.gate_up,
+                                                 2 * DFlashConfig::intermediate / tp, 5120, device);
+            target.down    = materialized_weight(backing, layer_source.down, 5120,
+                                                 DFlashConfig::intermediate / tp, device);
         }
         dflash2.final_norm =
-            artifact::materialized_tensor(backing, source.final_norm, NumericFormat::BF16, {5120});
+            artifact::materialized_tensor(backing, source.final_norm, NumericFormat::BF16, {5120},
+                                          device);
         dflash2.candidate_selector.hidden_projection =
-            materialized_weight(backing, source.candidate_selector.hidden_projection, 256, 5120);
+            materialized_weight(backing, source.candidate_selector.hidden_projection, 256, 5120,
+                                device);
         dflash2.candidate_selector.predecessor_codebook =
             artifact::materialized_tensor(backing, source.candidate_selector.predecessor_codebook,
-                                          NumericFormat::BF16, {256, 248320});
+                                          NumericFormat::BF16, {256, 248320}, device);
         dflash2.candidate_selector.successor_codebook =
             artifact::materialized_tensor(backing, source.candidate_selector.successor_codebook,
-                                          NumericFormat::BF16, {256, 248320});
+                                          NumericFormat::BF16, {256, 248320}, device);
     }
 
     if (plan.features.vision) {

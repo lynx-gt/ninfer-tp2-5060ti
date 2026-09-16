@@ -228,6 +228,11 @@ struct PeerRuntime {
     // head/channel shard and folds it here, so the two devices commit the same accepted prefix
     // from records neither ever exchanges.
     std::optional<GdnReplayRecords> replay_records;
+    // Rank 1's own DFlash2 draft state: the TP2 draft forward runs its half-head shard on each
+    // device (bindings.cpp 的 dflash2 分片规则), so each rank keeps its own halved local KV
+    // window. Planned from the same persistent layout as rank 0's; both halves are identical
+    // in shape by construction.
+    std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,

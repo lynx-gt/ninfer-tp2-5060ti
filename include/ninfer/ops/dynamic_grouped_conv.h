@@ -113,4 +113,42 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream);
 
+/**
+ * Op: dynamic_grouped_conv_add_tail
+ *
+ * Math / indexing:
+ *   H=5120, W=2..16, group width 16, G=320. Let h=16*g+j and z be `projected`:
+ *
+ *     residual[h,i,b] +=
+ *         (base_kernel[h,0,1] + finish_delta[g,0,i,b]) * z[h,i,b]
+ *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
+ *
+ *   This is exactly the convolution+residual half of `linear_dynamic_grouped_conv_add`, exposed
+ *   so a tensor-parallel caller can split the projection (one partial per rank over its own half
+ *   of the contraction, combined by one allreduce) and then run this tail REPLICATED on every
+ *   rank. `projected` is the same BF16 intermediate the fused implementation already
+ *   materializes before its tail consumes it (see the finish_kernel call site in
+ *   src/ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu), so the split
+ *   introduces no new rounding boundary.
+ *
+ * Logical shapes / supported domain:
+ *   projected is contiguous BF16 [5120,tokens]; base_kernel is contiguous BF16 [5120,2,2] with
+ *   axes [channel,tap,side]; finish_delta is contiguous BF16 [320,2,W,B]; and residual is
+ *   contiguous BF16 [5120,W,B] with tokens = W*B, W in [2,16] and B in [1,8]. Position zero has
+ *   no previous-tap contribution: the Op never reads another request or an earlier round.
+ *
+ * Numeric:
+ *   The oracle evaluates the formula naively in FP64 from the represented BF16 inputs. The
+ *   projection is not an input here -- `projected` IS the observable intermediate, taken at its
+ *   stored BF16 precision.
+ *
+ * Effects:
+ *   Updates every element of residual in place and preserves projected, base_kernel, and
+ *   finish_delta. All operand storage must be pairwise non-overlapping. The Op has no persistent
+ *   state side effect and needs no workspace.
+ */
+void dynamic_grouped_conv_add_tail(const Tensor& projected, const Tensor& base_kernel,
+                                   const Tensor& finish_delta, Tensor& residual,
+                                   cudaStream_t stream);
+
 } // namespace ninfer::ops

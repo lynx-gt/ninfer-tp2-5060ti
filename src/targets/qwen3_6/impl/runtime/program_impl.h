@@ -232,6 +232,7 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
+    if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
     io             = qwen3_6::RoundState(backing, plan.persistent.round);
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     token_counts   = plan.persistent.token_counts.bind(backing);
@@ -463,6 +464,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                                .replay_records   = peer->replay_records
                                                                        ? &*peer->replay_records
                                                                        : nullptr,
+                                               .dflash           = peer->dflash ? &*peer->dflash
+                                                                                : nullptr,
                                                .mtp_host_ingress = mtp_peer_host_ingress,
                                                .graph_bridge = graph_bridge ? &*graph_bridge
                                                                             : nullptr});
@@ -719,6 +722,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 dflash->restore_rewrite_checkpoint(static_cast<std::int32_t>(sequence.lane),
                                                    device.stream);
+                // TP2：草稿窗口每卡一份（各自半头），两卡必须一起回退到同一检查点，否则 rank 1
+                // 的 4 个 KV 头会停在旧窗口上，草稿提案随之失真。
+                if (peer && peer->dflash) {
+                    const ScopedDevice peer_scope(peer->device.device);
+                    peer->dflash->restore_rewrite_checkpoint(
+                        static_cast<std::int32_t>(sequence.lane), peer->device.stream);
+                }
                 sequence.dflash_context_frontier = base;
             }
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -1515,13 +1525,14 @@ void ProgramImplCore::prepare_graphs() {
             }
         });
     };
-    const auto zero_cyclic_lane = [&](CyclicKVCache& cache, std::uint32_t lane) {
+    const auto zero_cyclic_lane = [&](CyclicKVCache& cache, std::uint32_t lane,
+                                      cudaStream_t stream) {
         for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = cache.layer_view(layer);
             const Tensor k                    = view.k.slice(3, static_cast<std::int32_t>(lane), 1);
             const Tensor v                    = view.v.slice(3, static_cast<std::int32_t>(lane), 1);
-            CUDA_CHECK(cudaMemsetAsync(k.data, 0, k.bytes(), device.stream));
-            CUDA_CHECK(cudaMemsetAsync(v.data, 0, v.bytes(), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(k.data, 0, k.bytes(), stream));
+            CUDA_CHECK(cudaMemsetAsync(v.data, 0, v.bytes(), stream));
         }
     };
 
@@ -1544,13 +1555,14 @@ void ProgramImplCore::prepare_graphs() {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 p.decoder->linear_attention.zero_slot(
                     LinearStateSlots::current_state_slot(row, max_concurrency), p.device.stream);
+                if (p.dflash) { zero_cyclic_lane(p.dflash->local, row, p.device.stream); }
             }
         });
         for (std::uint32_t row = 0; row < batch_size; ++row) {
             decoder->linear_attention.zero_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
             if (dflash) {
-                zero_cyclic_lane(dflash->local, row);
+                zero_cyclic_lane(dflash->local, row, device.stream);
                 const Tensor pending =
                     dflash->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
                 CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
@@ -1851,14 +1863,19 @@ void ProgramImplCore::prepare_graphs() {
         }
     });
     if (dflash) {
-        const auto zero_cyclic_cache = [&](CyclicKVCache& cache) {
+        // TP2：草稿窗口每卡一份（各自半头），两卡一起清零，否则 rank 1 的 4 个头会留着
+        // 上一轮的槽位内容。
+        const auto zero_cyclic_cache = [&](CyclicKVCache& cache, cudaStream_t stream) {
             for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
                 const CyclicKVCacheLayerView view = cache.layer_view(layer);
-                CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), device.stream));
-                CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), device.stream));
+                CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), stream));
+                CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), stream));
             }
         };
-        zero_cyclic_cache(dflash->local);
+        zero_cyclic_cache(dflash->local, device.stream);
+        on_peer([&](PeerRuntime& p) {
+            if (p.dflash) { zero_cyclic_cache(p.dflash->local, p.device.stream); }
+        });
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
                                    dflash->prefill_features.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,

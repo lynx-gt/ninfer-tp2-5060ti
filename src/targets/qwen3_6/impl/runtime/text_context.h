@@ -193,6 +193,10 @@ struct TpExecution {
     qwen3_6::PagedKVCacheView mtp_kv;
     const qwen3_6::PagedKVCache* batch_mtp_kv = nullptr;
     const GdnReplayRecords* replay_records    = nullptr;
+    // Rank 1's own DFlash2 draft state. Present exactly when the plan enables DFlash2 at tp2;
+    // the TP2 draft forward runs its half-head shard on each device, so each rank owns its own
+    // halved local KV window (see schedule::TpPeerCore::dflash).
+    DFlashPersistentState* dflash = nullptr;
 
     [[nodiscard]] bool complete() const noexcept {
         return execution != nullptr && events != nullptr && device != nullptr &&
