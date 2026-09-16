@@ -34,6 +34,9 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <cstdlib>
+#include <type_traits>
+#include <vector>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
@@ -163,6 +166,30 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                                         local_positions, local_counts, lanes, layers,
                                         {local_envelope.min_count, local_envelope.max_count},
                                         state.execution.work, state.execution.device.stream);
+            // [dbg] 临时（仅 prefill）：① 打印 draft 环 layer0 K 平面哈希（比较不同 context 是否真的不同）
+            // ② NINFER_DBG_NOCTX=1 时把整环清零，用来判定"读侧是否真的在消费这份 KV"。
+            if constexpr (std::is_same_v<Context, PrefillContext>) {
+                static int dbg_ctx = 0;
+                if (++dbg_ctx <= 4) {
+                    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+                    const auto& view = dflash_state(state).local_layer(0);
+                    std::vector<std::uint8_t> buf(static_cast<std::size_t>(view.k.bytes()), 0);
+                    CUDA_CHECK(cudaMemcpy(buf.data(), view.k.data, view.k.bytes(),
+                                          cudaMemcpyDeviceToHost));
+                    std::uint64_t h = 1469598103934665603ULL;
+                    for (std::uint8_t b : buf) { h = (h ^ b) * 1099511628211ULL; }
+                    std::fprintf(stderr, "[dbg] ctxKV#%d hash=%016llx nonce=%s\n", dbg_ctx,
+                                 static_cast<unsigned long long>(h),
+                                 std::getenv("NINFER_DBG_NOCTX") ? "zeroed" : "normal");
+                    if (std::getenv("NINFER_DBG_NOCTX") != nullptr) {
+                        for (std::uint32_t layer = 0; layer < DFlashConfig::local_layers; ++layer) {
+                            const auto& v = dflash_state(state).local_layer(layer);
+                            CUDA_CHECK(cudaMemset(v.k.data, 0, v.k.bytes()));
+                            CUDA_CHECK(cudaMemset(v.v.data, 0, v.v.bytes()));
+                        }
+                    }
+                }
+            }
         } else {
             for (int layer = 0; layer < Config::layers; ++layer) {
                 auto layer_scope = state.execution.work.scope();
