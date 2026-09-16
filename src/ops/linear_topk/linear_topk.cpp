@@ -283,7 +283,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
         throw std::invalid_argument("linear_topk: id map overlaps input or output");
     }
 
-    execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream);
+    execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream,
+            head.n);
 }
 
 } // namespace ninfer::ops
