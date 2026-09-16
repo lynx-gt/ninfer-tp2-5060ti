@@ -2799,6 +2799,23 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       8 * static_cast<std::size_t>(sizeof(std::int32_t)),
                                       cudaMemcpyDeviceToHost));
             }
+            std::array<std::int32_t, 16> dbg_pids{};
+            std::array<std::int32_t, 16> dbg_ppos{};
+            CUDA_CHECK(cudaMemcpy(dbg_pids.data(), io.dflash_decode->proposal_ids.data,
+                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(dbg_ppos.data(), io.dflash_decode->proposal_positions.data,
+                                  8 * static_cast<std::size_t>(sizeof(std::int32_t)),
+                                  cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "[dbg] blk_ids=");
+            for (int j = 0; j < 8; ++j) {
+                std::fprintf(stderr, "%d,", dbg_pids[j]);
+            }
+            std::fprintf(stderr, " blk_pos=");
+            for (int j = 0; j < 8; ++j) {
+                std::fprintf(stderr, "%d,", dbg_ppos[j]);
+            }
+            std::fputc(10, stderr);
             std::fprintf(stderr, "[dbg] cand=");
             for (int j = 0; j < 8; ++j) {
                 std::fprintf(stderr, "%d,", dbg_cand[j]);
