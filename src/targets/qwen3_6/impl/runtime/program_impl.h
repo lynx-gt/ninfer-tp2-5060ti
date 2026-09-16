@@ -770,7 +770,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             *dflash_host_ingress                         = {};
             dflash_host_ingress->active_lanes[0]                = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[0] =
+                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                        device.stream));
@@ -2684,8 +2685,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const SequenceState& sequence = sequences[lane];
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
-            sequence.kv->text.bound_row() < 0 || sequence.kv->backend->bound_row() < 0 ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            sequence.kv->text.bound_row() < 0 ||
+            // DFlash2 没有独立的 backend KV（草稿用 dflash->local），backend_kv_cache() 为空；
+            // 照搬 master 的条件写法，只有真存在 backend KV 时才要求它已绑定。
+            (backend_kv_cache() != nullptr &&
+             (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
@@ -2748,7 +2753,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
             }
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
-            dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[row] =
+                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             dflash_host_ingress->active_lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
