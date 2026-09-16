@@ -426,7 +426,7 @@ DeviceLayers make_device_layers(
             static_cast<const std::uint8_t*>(source.value_weight.scales),
             static_cast<const __nv_bfloat16*>(source.key_norm_weight.data),
             static_cast<__nv_bfloat16*>(source.cache.k.data),
-            static_cast<__half*>(source.cache.v.data),
+            static_cast<__nv_bfloat16*>(source.cache.v.data),
             static_cast<std::int32_t>(source.cache.padded_capacity),
         };
     }
