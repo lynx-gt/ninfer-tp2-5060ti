@@ -96,6 +96,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
+        using Config               = typename V::DFlashConfig;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
@@ -325,6 +326,11 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         if (tp && state.execution.proposal_head == ProposalHead::Full) {
             const auto peer_valid = full_valid - local_valid;
             if (peer_valid > 0) {
+                // 跨卡这段是手工排的，没有集合通信帮忙排序，必须自己用事件把两条流串起来，
+                // 否则（1）rank1 拷 hidden 时 rank0 还没算完、（2）rank0 拷候选时 rank1 还没算完，
+                // 两个方向都会读到上一轮的残留 —— 实测漏掉时 rank1 候选整片读到 0，草稿大面积失配。
+                // 事件用 PeerEvents 的 inputs_ready：语义就是"某卡的数据已就绪"，与集合通信同一套
+                // 复用纪律（先发 wait 再发 record）。
                 CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
                 CUDA_CHECK(cudaSetDevice(tp->device->device));
                 CUDA_CHECK(
