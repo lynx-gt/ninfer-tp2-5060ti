@@ -295,11 +295,15 @@ void finish_dynamic_branch(DeviceContext& device, WorkspaceArena& work, const Te
 //
 // `peer_hidden` 为 tp2 草稿自算出的 rank 1 hidden（两卡逐位相同，省掉一次 82KB 拷贝与一对事件）；
 // 传 nullptr 时按原路径把 rank 0 的 hidden 拷到 rank 1 再算（tp1 及混合路径保持不变）。
+//
+// 模板参必须是 Variant（而非具体权重类型）：`candidate_selector` 是 DFlash2 专有成员，经由 V
+// 取得 weights 才让这些访问成为依赖名，35B 的 DFlash 变体因此不会在解析期被实例化检查。
+template <class V>
 void dflash2_select_candidates(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
                                const Tensor& hidden, const Tensor* peer_hidden, int batch, int k) {
+    const typename V::ModelView::DFlash& weights = *state.execution.model.dflash;
     auto& work                = state.execution.work;
     const cudaStream_t stream = state.execution.device.stream;
-    const auto& weights       = *state.execution.model.dflash;
     const int mask_columns    = k * batch;
     Tensor candidates         = frame.candidate_ids.slice(2, 0, batch);
     Tensor ids_flat           = candidates.view({16, mask_columns});
@@ -385,6 +389,9 @@ template <class V>
 void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
                                const TpExecution& tp, int batch, int k, DFlashEnvelopes envelopes) {
     using Config = typename V::DFlashConfig;
+    // 权重视图经由 V 取（依赖类型），否则 35B 的 DFlashLayerWeights 会在解析期被这里的
+    // DFlash2 专有成员访问（attention_conv / mlp_conv）打中。
+    using DFlashWeights = typename V::ModelView::DFlash;
     static_assert(Config::layers == Config::local_layers,
                   "DFlash2 TP2 前传只实现了全 local 层的草稿");
     if (!tp.dflash) {
@@ -392,9 +399,12 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     }
     const ExecutionContext& ec      = *tp.execution;
     WorkspaceArena* work[2]         = {&state.execution.work, tp.work};
-    const LoadedModelData* model[2] = {&state.execution.model, tp.weights};
-    qwen3_6::DFlashDecodeState* frames[2]  = {&frame, &*tp.io->dflash_decode};
+    DeviceContext* device[2]        = {&state.execution.device, tp.device};
+    const LoadedModelData* runtime[2]     = {&state.execution.model, tp.weights};
+    qwen3_6::DFlashDecodeState* frames[2] = {&frame, &*tp.io->dflash_decode};
     DFlashPersistentState* draft_state[2] = {&dflash_state(state), tp.dflash};
+    const DFlashWeights* weights[2]       = {&*state.execution.model.dflash,
+                                             &*tp.weights->dflash};
 
     const int width        = k + 1;
     const int columns      = width * batch;
@@ -408,7 +418,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     std::array<Tensor, 2> residual;
     for_each_rank(ec, [&](int rank) {
         const auto r    = static_cast<std::size_t>(rank);
-        cudaStream_t s  = ec.dev[rank]->stream;
+        cudaStream_t s  = device[rank]->stream;
         auto& f         = *frames[r];
         Tensor anchors  = f.anchors.slice(0, 0, batch);
         Tensor frontiers = f.execution_frontiers.slice(0, 0, batch);
@@ -419,8 +429,8 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
         ops::prepare_masked_block(anchors, frontiers, valid, Config::mask_token, ids, positions,
                                   s);
         residual[r] = work[r]->alloc(DType::BF16, {Config::hidden, width, batch});
-        ops::embedding(ids.view({columns}), model[r]->token_embedding,
-                       residual[r].view({Config::hidden, columns}), s);
+        Tensor flat_residual = residual[r].view({Config::hidden, columns});
+        ops::embedding(ids.view({columns}), runtime[rank]->token_embedding, flat_residual, s);
     });
 
     for (std::size_t layer_index = 0; layer_index < Config::layers; ++layer_index) {
@@ -436,11 +446,11 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
             std::array<WorkspaceArena::Scope, 2> scopes = {work[0]->scope(), work[1]->scope()};
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
-                cudaStream_t s    = ec.dev[rank]->stream;
+                cudaStream_t s    = device[rank]->stream;
                 auto& f           = *frames[r];
-                const auto& layer = model[r]->dflash->layers[layer_index];
+                const auto& layer = weights[r]->layers[layer_index];
                 auto branch = workspace_recipe::dflash2_branch<Config>(*work[r], width, batch);
-                prepare_dynamic_branch(*ec.dev[r], *work[r], residual[r], layer.input_norm,
+                prepare_dynamic_branch(*device[r], *work[r], residual[r], layer.input_norm,
                                        Config::rms_epsilon, layer.attention_conv, branch);
                 prepared[r] = branch.prepared;
                 delta[r]    = branch.finish_delta;
@@ -450,16 +460,16 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                     DType::BF16, {Config::head_dim, Config::kv_heads, width, batch});
                 Tensor value = work[r]->alloc(
                     DType::BF16, {Config::head_dim, Config::kv_heads, width, batch});
+                Tensor query_flat = query.view({Config::query_size, columns});
+                Tensor key_flat   = key.view({Config::kv_size, columns});
+                Tensor value_flat = value.view({Config::kv_size, columns});
+                Tensor positions  = f.proposal_positions.slice(1, 0, batch);
                 ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
-                                     layer.query_key_value,
-                                     query.view({Config::query_size, columns}),
-                                     key.view({Config::kv_size, columns}),
-                                     value.view({Config::kv_size, columns}), s);
-                ops::rmsnorm_rope(f.proposal_positions.slice(1, 0, batch), layer.query_norm,
-                                  layer.key_norm, query, key, s);
+                                     layer.query_key_value, query_flat, key_flat, value_flat, s);
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, s);
                 attention[r] = work[r]->alloc(
                     DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
-                ops::swa(query, key, value, f.proposal_positions.slice(1, 0, batch),
+                ops::swa(query, key, value, positions,
                          f.proposal_valid_columns.slice(0, 0, batch),
                          f.state_destination_slots.slice(0, 0, batch), Config::attention_scale,
                          draft_state[r]->local_layer(static_cast<std::uint32_t>(layer_index)),
@@ -473,17 +483,18 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
             }
             // 行并行：rank r 取 attention 输出（两卡逐位相同，含全部 32 头）的第 r 个 2048 行块，
             // 各自算 [5120,2048] 权重 shard 的部分积，一次 allreduce 得到完整投影。
-            ops::linear_row_parallel(
-                {attention[0].view({Config::query_size, columns}).slice(0, 0, kQRows),
-                 attention[1].view({Config::query_size, columns}).slice(0, kQRows, kQRows)},
-                {model[0]->dflash->layers[layer_index].attention_output,
-                 model[1]->dflash->layers[layer_index].attention_output},
-                projected, staging, ec, *tp.events);
+            Tensor context0 = attention[0].view({Config::query_size, columns});
+            Tensor context1 = attention[1].view({Config::query_size, columns});
+            ops::linear_row_parallel({context0.slice(0, 0, kQRows),
+                                      context1.slice(0, kQRows, kQRows)},
+                                     {weights[0]->layers[layer_index].attention_output,
+                                      weights[1]->layers[layer_index].attention_output},
+                                     projected, staging, ec, *tp.events);
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
-                const auto& layer = model[r]->dflash->layers[layer_index];
+                const auto& layer = weights[r]->layers[layer_index];
                 ops::dynamic_grouped_conv_add_tail(projected[r], layer.attention_conv.base_kernel,
-                                                   delta[r], residual[r], ec.dev[rank]->stream);
+                                                   delta[r], residual[r], device[rank]->stream);
             });
         }
         // ---- MLP 分支：gate_up 列并行（每卡 [17408,5120] shard，gate'|up'），down 行并行 ----
@@ -494,9 +505,9 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
             std::array<WorkspaceArena::Scope, 2> scopes = {work[0]->scope(), work[1]->scope()};
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
-                const auto& layer = model[r]->dflash->layers[layer_index];
+                const auto& layer = weights[r]->layers[layer_index];
                 auto branch = workspace_recipe::dflash2_branch<Config>(*work[r], width, batch);
-                prepare_dynamic_branch(*ec.dev[r], *work[r], residual[r],
+                prepare_dynamic_branch(*device[r], *work[r], residual[r],
                                        layer.post_attention_norm, Config::rms_epsilon,
                                        layer.mlp_conv, branch);
                 prepared[r] = branch.prepared;
@@ -506,8 +517,8 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
             ops::linear_column_parallel(
                 {prepared[0].view({Config::hidden, columns}),
                  prepared[1].view({Config::hidden, columns})},
-                {model[0]->dflash->layers[layer_index].gate_up,
-                 model[1]->dflash->layers[layer_index].gate_up},
+                {weights[0]->layers[layer_index].gate_up,
+                 weights[1]->layers[layer_index].gate_up},
                 gate_up, ec);
             // 每卡的 gate' 与 up' 都是自己那半 shard 的两段：列切把 gate_up 切成两个独立块，
             // rank r 持有 gate 的第 r 个半块与 up 的第 r 个半块，SiLU 配对是卡内的，无需通信。
@@ -519,7 +530,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                     work[r]->alloc(DType::BF16, {kShardIntermediate, columns});
                 ops::silu_mul(gate_up[r].slice(0, 0, kShardIntermediate),
                               gate_up[r].slice(0, kShardIntermediate, kShardIntermediate),
-                              activation[r], ec.dev[rank]->stream);
+                              activation[r], device[rank]->stream);
             });
             std::array<Tensor, 2> projected;
             std::array<Tensor, 2> staging;
@@ -529,14 +540,13 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
             }
             ops::linear_row_parallel(
                 activation,
-                {model[0]->dflash->layers[layer_index].down,
-                 model[1]->dflash->layers[layer_index].down},
+                {weights[0]->layers[layer_index].down, weights[1]->layers[layer_index].down},
                 projected, staging, ec, *tp.events);
             for_each_rank(ec, [&](int rank) {
-                const auto r   = static_cast<std::size_t>(rank);
-                const auto& layer = model[r]->dflash->layers[layer_index];
+                const auto r      = static_cast<std::size_t>(rank);
+                const auto& layer = weights[r]->layers[layer_index];
                 ops::dynamic_grouped_conv_add_tail(projected[r], layer.mlp_conv.base_kernel,
-                                                   delta[r], residual[r], ec.dev[rank]->stream);
+                                                   delta[r], residual[r], device[rank]->stream);
             });
         }
     }
@@ -544,10 +554,10 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     for_each_rank(ec, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         hidden[r]    = work[r]->alloc(DType::BF16, {Config::hidden, mask_columns});
-        ops::rmsnorm_pack_tail(residual[r], model[r]->dflash->final_norm, hidden[r],
-                               ec.dev[rank]->stream);
+        ops::rmsnorm_pack_tail(residual[r], weights[r]->final_norm, hidden[r],
+                               device[rank]->stream);
     });
-    dflash2_select_candidates(state, frame, hidden[0], &hidden[1], batch, k);
+    dflash2_select_candidates<V>(state, frame, hidden[0], &hidden[1], batch, k);
     work[0]->reset();
     work[1]->reset();
 }
@@ -631,7 +641,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         }
         Tensor hidden = work.alloc(DType::BF16, {Config::hidden, mask_columns});
         ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
-        dflash2_select_candidates(state, frame, hidden, nullptr, batch, k);
+        dflash2_select_candidates<V>(state, frame, hidden, nullptr, batch, k);
         work.reset();
     }
 }
