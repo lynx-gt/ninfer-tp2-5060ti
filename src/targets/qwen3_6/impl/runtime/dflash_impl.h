@@ -275,6 +275,12 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 Tensor query_flat = query.view({Config::query_size, columns});
                 Tensor key_flat   = key.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
+                std::fprintf(stderr, "[dbg] attn_in: cols=%d prepared=%d,%d,%d,%d dt=%d qkv=%d,%d fmt=%d\n",
+                             columns, branch.prepared.ne[0], branch.prepared.ne[1],
+                             branch.prepared.ne[2], branch.prepared.ne[3],
+                             static_cast<int>(branch.prepared.dtype), layer.query_key_value.n,
+                             layer.query_key_value.k,
+                             static_cast<int>(layer.query_key_value.qtype));
                 ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
                                      layer.query_key_value, query_flat, key_flat, value_flat,
                                      stream);
