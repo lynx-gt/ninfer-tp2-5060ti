@@ -18,8 +18,7 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     // tuned kernel set. See q5_dispatch.cpp for the rules every family follows here.
     const bool tp2_shard = (n == 7168 && k == 5120) || (n == 5120 && k == 3072);
     if ((!supported_problem && !tp2_shard) || t <= 0) {
-        std::fprintf(stderr, "[dbg] bf16 linear: n=%d k=%d t=%d
-", n, k, t);
+        std::fprintf(stderr, "[dbg] bf16 linear: n=%d k=%d t=%d\n", n, k, t);
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
     if (tp2_shard) { return launch_bf16_mma; }
