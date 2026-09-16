@@ -367,8 +367,8 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                     for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%d,", dbg_a[i]); }
                     std::fprintf(stderr, " b=");
                     for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%d,", dbg_b[i]); }
-                    std::fprintf(stderr, " shard=%d
-", shard_rows);
+                    std::fprintf(stderr, " shard=%d", shard_rows);
+                    std::fputc(10, stderr);
                     ops::topk_pair_merge(ids_flat, scores, remote_ids, remote_scores, ids_flat,
                                          scores, shard_rows, stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -376,8 +376,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                                           cudaMemcpyDeviceToHost));
                     std::fprintf(stderr, "[dbg] merged=");
                     for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%d,", dbg_m[i]); }
-                    std::fprintf(stderr, "
-");
+                    std::fputc(10, stderr);
                 }
             }
         }
