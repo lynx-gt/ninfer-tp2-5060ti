@@ -2786,6 +2786,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             // 每行只印第 0 号 lane 的列，够看清对齐关系。
             std::array<std::int32_t, 16> dbg_drafts{};
             std::array<std::int32_t, 16> dbg_argmax{};
+            std::array<std::int32_t, 16> dbg_cand{};
             CUDA_CHECK(cudaMemcpy(dbg_drafts.data(), io.dflash_decode->draft_tokens.data,
                                   draft_window * static_cast<std::size_t>(sizeof(std::int32_t)),
                                   cudaMemcpyDeviceToHost));
@@ -2793,7 +2794,16 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                   (draft_window + 1U) *
                                       static_cast<std::size_t>(sizeof(std::int32_t)),
                                   cudaMemcpyDeviceToHost));
-            std::fprintf(stderr, "[dbg] drafts=");
+            if (io.dflash_decode->candidate_ids.data != nullptr) {
+                CUDA_CHECK(cudaMemcpy(dbg_cand.data(), io.dflash_decode->candidate_ids.data,
+                                      8 * static_cast<std::size_t>(sizeof(std::int32_t)),
+                                      cudaMemcpyDeviceToHost));
+            }
+            std::fprintf(stderr, "[dbg] cand=");
+            for (int j = 0; j < 8; ++j) {
+                std::fprintf(stderr, "%d,", dbg_cand[j]);
+            }
+            std::fprintf(stderr, " drafts=");
             for (std::uint32_t j = 0; j < draft_window; ++j) {
                 std::fprintf(stderr, "%d,", dbg_drafts[j]);
             }
