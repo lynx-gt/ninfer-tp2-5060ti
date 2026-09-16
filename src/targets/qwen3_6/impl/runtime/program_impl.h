@@ -955,7 +955,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.lanes.slice(0, 0, batch);
-            } else if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
+            } else if (is_masked_draft_backend(speculative_backend) && io.dflash_decode) {
                 qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
                 hidden                            = frame.target_hidden.slice(2, 0, batch);
@@ -1831,7 +1831,7 @@ void ProgramImplCore::prepare_graphs() {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative,
                                  synchronize_all);
     }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
+    if (is_masked_draft_backend(speculative_backend)) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,
                                  synchronize_all);
     }
@@ -2240,7 +2240,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-            if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (is_masked_draft_backend(speculative_backend)) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
 
@@ -2336,7 +2336,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 (!staged.prepare_mtp || sequence.mtp_kv_valid < frontier - 1)) {
                 throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
-            if (speculative_backend == SpeculativeBackend::DFlash &&
+            if (is_masked_draft_backend(speculative_backend) &&
                 (!dflash || !sequence.kv || !sequence.kv->backend ||
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
@@ -2655,7 +2655,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets) {
-    if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
+    if (!is_masked_draft_backend(speculative_backend) || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
