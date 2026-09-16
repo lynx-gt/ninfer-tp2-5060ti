@@ -15,10 +15,20 @@ static W8Launch forced_w8_launch() {
     static constexpr Entry kEntries[] = {
         {"simt_c4", launch_w8_simt_r8_c4},   {"simt_c8", launch_w8_simt_r8_c8},
         {"small_t", launch_w8_small_t},       {"decode_r4", launch_w8_decode_r4},
-        {"mma_r32_c64", launch_w8_mma_r32_c64}, {"mma_r32_c128", launch_w8_mma_r32_c128},
-        {"mma_r64_c96", launch_w8_mma_r64_c96}, {"mma_r64_c128", launch_w8_mma_r64_c128},
+        {"mma_r32_c64", launch_w8_mma_r32_c64}, {"mma_r32_c96", launch_w8_mma_r32_c96},
+        {"mma_r32_c128", launch_w8_mma_r32_c128},
+        {"mma_r48_c64", launch_w8_mma_r48_c64}, {"mma_r48_c96", launch_w8_mma_r48_c96},
+        {"mma_r48_c112", launch_w8_mma_r48_c112}, {"mma_r48_c128", launch_w8_mma_r48_c128},
+        {"mma_r64_c96", launch_w8_mma_r64_c96}, {"mma_r64_c112", launch_w8_mma_r64_c112},
+        {"mma_r64_c128", launch_w8_mma_r64_c128},
+        {"mma_r96_c96", launch_w8_mma_r96_c96},
+        {"mma_r128_c64", launch_w8_mma_r128_c64}, {"mma_r128_c80", launch_w8_mma_r128_c80},
         {"mma_r64x16", launch_w8_mma_r64x16_c48_k128_a1},
         {"mma_r64x32", launch_w8_mma_r64x32_c64_k128_a1},
+        {"exact_t_splitk", launch_w8_exact_t_splitk},
+        {"exact_t_composite", launch_w8_exact_t_composite},
+        {"dflash_medium", launch_w8_dflash_medium},
+        {"medium_splitk_c144", launch_w8_medium_splitk_c144},
     };
     for (const Entry& e : kEntries) {
         if (std::strcmp(force, e.name) == 0) { return e.launch; }
