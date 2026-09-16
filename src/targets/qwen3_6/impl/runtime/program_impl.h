@@ -2096,17 +2096,21 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
-        if (!sequence.kv || !sequence.kv->backend || sequence.kv->text.bound_row() < 0 ||
-            sequence.kv->backend->bound_row() < 0 || end64 > capacity) {
+        if (!sequence.kv || sequence.kv->text.bound_row() < 0 ||
+            (backend_kv_cache() != nullptr &&
+             (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
+            end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
         dflash_host_ingress->context_frontiers[row] =
             checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
-        dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+        dflash_host_ingress->dflash_kv_table_rows[row] =
+            sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
         dflash_host_ingress->active_lanes[row]                = static_cast<std::int32_t>(lane);
-        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
+        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end),
+                                backend_kv_cache() != nullptr ? end : 0U);
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
     }
