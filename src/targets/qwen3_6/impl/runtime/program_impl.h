@@ -2336,8 +2336,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 (!staged.prepare_mtp || sequence.mtp_kv_valid < frontier - 1)) {
                 throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
+            // DFlash2 的复用检查点存在草稿的 local cyclic cache 里（dflash->local 的
+            // lane_capacity/2 偏移），不占 text 的 backend KV：所以 backend 那一项只对 DFlash(1)
+            // 成立，对 DFlash2 写死检查会误判。
             if (is_masked_draft_backend(speculative_backend) &&
-                (!dflash || !sequence.kv || !sequence.kv->backend ||
+                (!dflash ||
+                 (speculative_backend == SpeculativeBackend::DFlash &&
+                  (!sequence.kv || !sequence.kv->backend)) ||
                  sequence.dflash_context_frontier < frontier)) {
                 std::fprintf(stderr, "[dbg] rwckpt: dflash=%d kv=%d backend=%d fr=%u/%u\n",
                              dflash ? 1 : 0, sequence.kv ? 1 : 0,
