@@ -2801,6 +2801,27 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
             std::array<std::int32_t, 16> dbg_pids{};
             std::array<std::int32_t, 16> dbg_ppos{};
+            // 完整候选矩阵：candidate_ids 是 [16,K,B]，row-major ⇒ cand[c*K + i]（B=1）。
+            std::array<std::int32_t, 128> dbg_all{};
+            if (io.dflash_decode->candidate_ids.data != nullptr) {
+                CUDA_CHECK(cudaMemcpy(dbg_all.data(), io.dflash_decode->candidate_ids.data,
+                                      16 * draft_window *
+                                          static_cast<std::size_t>(sizeof(std::int32_t)),
+                                      cudaMemcpyDeviceToHost));
+            }
+            for (std::uint32_t i = 0; i < draft_window; ++i) {
+                std::fprintf(stderr, "[dbg] col%u:", i);
+                for (int c = 0; c < 16; ++c) {
+                    std::fprintf(stderr, " %d", dbg_all[c * draft_window + i]);
+                }
+                // 目标 argmax[i]（预测位置 i+1 的真值）是否在该列的候选集里
+                bool present = false;
+                for (int c = 0; c < 16; ++c) {
+                    if (dbg_all[c * draft_window + i] == dbg_argmax[i]) { present = true; }
+                }
+                std::fprintf(stderr, "  | target=%d in_set=%d draft=%d\n", dbg_argmax[i],
+                             present ? 1 : 0, dbg_drafts[i]);
+            }
             CUDA_CHECK(cudaMemcpy(dbg_pids.data(), io.dflash_decode->proposal_ids.data,
                                   8 * static_cast<std::size_t>(sizeof(std::int32_t)),
                                   cudaMemcpyDeviceToHost));
