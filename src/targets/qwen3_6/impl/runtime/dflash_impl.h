@@ -597,10 +597,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         }
 
         // 本 fork 的 TextContext 多两个参数：per-rank 的 rope 频率表与 tp 执行上下文。
+        // tp2 时**必须**把 tp 传进来：目标验证要跑两卡版本（rank 1 有自己的 KV/GDN 状态），
+        // 否则 tp2() 为假、验证路径会退回单卡并抛异常。
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
                          state.execution.io, state.execution.prefill_hidden,
-                         state.execution.prefill_chunk, 0, {}, &state.text_cache);
+                         state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr,
+                         tp ? &*tp : nullptr);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, active_lanes, valid_columns, width, batch_size);
         {
