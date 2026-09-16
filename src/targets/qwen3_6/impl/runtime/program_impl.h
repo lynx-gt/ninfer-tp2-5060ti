@@ -2878,6 +2878,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             std::fprintf(stderr, " rope_pos=");
             for (int j = 0; j < 8; ++j) { std::fprintf(stderr, "%d,", dbg_vrope[j]); }
             std::fputc(10, stderr);
+            // 授权出去的 token 与 verify 的 argmax 必须逐位一致（贪心无惩罚时这是引擎的硬不变式）
+            {
+                const int count = dflash_host_egress->licensed_counts[0];
+                std::fprintf(stderr, "[dbg] licensed(n=%d)=", count);
+                for (int j = 0; j < count && j < 8; ++j) {
+                    std::fprintf(stderr, "%d,", dflash_host_egress->licensed_tokens[j]);
+                }
+                std::fprintf(stderr, " argmax=");
+                for (int j = 0; j < count && j < 8; ++j) {
+                    std::fprintf(stderr, "%d,", dbg_argmax[j]);
+                }
+                std::fputc(10, stderr);
+            }
             std::fprintf(stderr, "[dbg] cand=");
             for (int j = 0; j < 8; ++j) {
                 std::fprintf(stderr, "%d,", dbg_cand[j]);
