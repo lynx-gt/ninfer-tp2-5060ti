@@ -10,7 +10,9 @@
 namespace ninfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
+    const bool n256_k5120 = n == 256 && k == 5120;
+    const bool supported_problem =
+        (n == 14336 && k == 5120) || (n == 5120 && k == 6144) || n256_k5120;
     // TP2 shards of the two registered problems: attention/query_key_gate_value splits
     // column-parallel (14336 -> 7168) and attention/output row-parallel (6144 -> 3072). BF16's
     // decode and small-T launchers are exact-geometry (see bf16_gemv.cu / bf16_small_t.cu), so a
@@ -18,9 +20,9 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     // tuned kernel set. See q5_dispatch.cpp for the rules every family follows here.
     const bool tp2_shard = (n == 7168 && k == 5120) || (n == 5120 && k == 3072);
     if ((!supported_problem && !tp2_shard) || t <= 0) {
-        std::fprintf(stderr, "[dbg] bf16 linear: n=%d k=%d t=%d\n", n, k, t);
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
+    if (n256_k5120) { return launch_bf16_n256_k5120; }
     if (tp2_shard) { return launch_bf16_mma; }
     if (t == 1) { return launch_bf16_decode; }
     const std::int32_t small_t_end =
