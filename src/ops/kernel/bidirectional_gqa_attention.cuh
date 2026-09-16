@@ -17,6 +17,9 @@ inline constexpr int kBidirectionalGqaKVHeads  = 8;
 inline constexpr int kBidirectionalGqaGroup    = 4;
 inline constexpr int kBidirectionalGqaMaxSplit = 85;
 inline constexpr int kSwaWindow                = 4096;
+// 运行时滑窗 = cyclic cache 的 capacity（27B DFlash2 草稿是 2048，35B DFlash 是 4096）。
+// 这个值同时是环形槽位的掩码宽度，两者必须一致，否则位置 >= capacity 的 context key 会
+// 落到别的槽位上（把环形 cache 读两遍）。
 
 __device__ __forceinline__ int bidirectional_gqa_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -91,7 +94,9 @@ bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
         const int safe_row = live ? row : 0;
         std::int64_t src_index;
         if constexpr (CyclicSwa) {
-            const int context_position = (live ? key0 + row : 0) & (kSwaWindow - 1);
+            // 槽位掩码 = 环形 cache 的 stride（padded_capacity），不是常量 4096：
+            // 27B DFlash2 草稿的 cache 只有 2048 槽，用 4095 掩码会读错槽位。
+            const int context_position = (live ? key0 + row : 0) & (context_stride - 1);
             src_index = query_tile ? bidirectional_gqa_query_kv_index(kv_head, d, safe_row)
                                    : bidirectional_gqa_cyclic_context_index(
                                          kv_head, d, context_position, context_stride);
@@ -173,7 +178,8 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    // 滑窗宽度 = 环形 cache 的容量（27B DFlash2=2048，35B DFlash=4096），不是常量。
+    const int context_count = CyclicSwa ? min(length, context_stride - 1) : length;
     const int context_start = length - context_count;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
@@ -370,16 +376,20 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             const bool row1_live = row1 < RowCount && row1 / kBidirectionalGqaGroup < valid;
             const bool allow00 =
                 row0_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position0 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col0 >= q_position0 - (context_stride - 1));
             const bool allow01 =
                 row0_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position0 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col1 >= q_position0 - (context_stride - 1));
             const bool allow10 =
                 row1_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position1 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col0 >= q_position1 - (context_stride - 1));
             const bool allow11 =
                 row1_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position1 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col1 >= q_position1 - (context_stride - 1));
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
             score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
@@ -555,7 +565,7 @@ noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                           const std::int32_t* __restrict__ context_state,
                           const std::int32_t* __restrict__ valid_columns, int max_context,
-                          int split_capacity, __nv_bfloat16* __restrict__ out) {
+                          int split_capacity, int window, __nv_bfloat16* __restrict__ out) {
     const int q_head = static_cast<int>(blockIdx.x);
     const int token  = static_cast<int>(blockIdx.y);
     const int batch  = static_cast<int>(blockIdx.z);
@@ -582,7 +592,7 @@ noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_count = CyclicSwa ? min(length, window - 1) : length;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
     __shared__ float reduce[128];
@@ -639,7 +649,7 @@ __launch_bounds__(128, 2) __global__
                                          __nv_bfloat16* __restrict__ out) {
     noncausal_gqa_reduce_body<false, Tokens, KeyBlock>(partial_acc, partial_m, partial_l,
                                                        context_length, valid_columns, max_context,
-                                                       split_capacity, out);
+                                                       split_capacity, kSwaWindow, out);
 }
 
 template <int Tokens, int KeyBlock, int WarpsPerBlock>
@@ -648,7 +658,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
                            const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                            const std::int32_t* __restrict__ positions,
                            const std::int32_t* __restrict__ valid_columns, int max_context,
-                           int split_capacity, __nv_bfloat16* __restrict__ out) {
+                           int split_capacity, int window, __nv_bfloat16* __restrict__ out) {
     static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
     constexpr int MaxSplits = 128;
     constexpr unsigned Mask = 0xffffffffu;
@@ -681,7 +691,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
         }
         return;
     }
-    const int context_count = min(length, kSwaWindow - 1);
+    const int context_count = min(length, window - 1);
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
 
