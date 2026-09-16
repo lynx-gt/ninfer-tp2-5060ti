@@ -188,7 +188,8 @@ Tensor column_slice(const Tensor& tensor, int first, int columns) {
 }
 
 void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Tensor& ids,
-             Tensor& scores, WorkspaceArena& workspace, cudaStream_t stream) {
+             Tensor& scores, WorkspaceArena& workspace, cudaStream_t stream,
+             std::int32_t valid_rows) {
     const auto profile = resolve_profile(head.qtype, head.n, head.k);
     for (int first = 0; first < hidden.ne[1];) {
         const int columns  = std::min(detail::kLinearTopKMaxChunkColumns, hidden.ne[1] - first);
@@ -202,10 +203,10 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
         require_scratch_nonoverlap(hidden, ids, scores, id_map, scratch);
         require_no_weight_overlap(head, hidden, ids, scores, id_map, scratch);
         if (profile == HeadProfile::W8Full)
-            detail::linear_topk_w8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
+            detail::linear_topk_w8_launch(x, head, valid_rows, scratch,
                                           stream);
         else if (profile == HeadProfile::Fp8Full)
-            detail::linear_topk_fp8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
+            detail::linear_topk_fp8_launch(x, head, valid_rows, scratch,
                                            stream);
         else
             detail::linear_topk_q4_launch(x, head, *id_map, scratch, stream);
@@ -249,7 +250,12 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
                  cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
     const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
-    if (profile == HeadProfile::Q4Optimized || valid_rows != detail::kLinearTopKFullValidRows) {
+    // 整词表头要求 valid_rows == 248077；tp2 的行分片头（每卡 124160 行）允许 valid_rows <= head.n。
+    const bool sharded_head = head.n == detail::kLinearTopKFullRows / 2;
+    const bool valid_ok =
+        valid_rows == detail::kLinearTopKFullValidRows ||
+        (sharded_head && valid_rows > 0 && valid_rows <= head.n);
+    if (profile == HeadProfile::Q4Optimized || !valid_ok) {
         throw std::invalid_argument("linear_topk: invalid full-head profile or valid_rows");
     }
     if (profile == HeadProfile::W8Full) {
@@ -258,7 +264,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }
 
-    execute(hidden, head, nullptr, candidate_ids, candidate_scores, workspace, stream);
+    execute(hidden, head, nullptr, candidate_ids, candidate_scores, workspace, stream,
+            valid_rows);
 }
 
 void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
