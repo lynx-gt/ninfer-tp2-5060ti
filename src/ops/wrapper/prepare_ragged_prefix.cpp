@@ -27,7 +27,6 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
         positions.ne[1] != batch || positions.ne[2] != 1 || positions.ne[3] != 1 ||
         !vector_shape(lanes) || !vector_shape(starts) || !vector_shape(ends) ||
         !vector_shape(counts)) {
-        std::fprintf(stderr,
         throw std::invalid_argument("prepare_ragged_prefix: invalid tensor geometry");
     }
     if (source.data == nullptr || destination.data == nullptr || !destination.is_contiguous() ||

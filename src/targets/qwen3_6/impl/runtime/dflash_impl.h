@@ -325,11 +325,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         if (tp && state.execution.proposal_head == ProposalHead::Full) {
             const auto peer_valid = full_valid - local_valid;
             if (peer_valid > 0) {
+                CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
                 CUDA_CHECK(cudaSetDevice(tp->device->device));
-                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
-                    CUDA_CHECK(
-                        cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
-                }
+                CUDA_CHECK(
+                    cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
                 // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
                 Tensor peer_hidden = tp->work->alloc(DType::BF16, {Config::hidden, mask_columns});
                 Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
