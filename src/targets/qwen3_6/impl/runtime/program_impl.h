@@ -99,14 +99,8 @@ schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uin
 schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
                                            std::uint32_t k) {
     (void)min_frontier;
-    // swa 的 context 扫描上界就是 env.max_context（launcher 里 `context_rows =
-    // min(envelope.max_context, 4095)`），而契约要求 caller 保证 min_context <= L <= max_context。
-    // 草稿能看到的最远 key 由环窗口决定（绝对位置 p 落在 [L-padded_capacity, L)），所以上界取
-    // **环容量**才是恒正确的：给 max_frontier（图 profile 的上界，实测会小到 96）会让草稿只扫
-    // 96 行 context —— 353 个 token 里 3/4 看不见，表现为"草稿完全不吃上下文"。
-    const auto draft_window = static_cast<std::uint32_t>(DFlashConfig::local_capacity);
     return schedule::DFlashEnvelopes{
-        .local  = {0, draft_window},
+        .local  = {0, max_frontier},
         .full   = {0, max_frontier},
         .append = {0, k + 1},
     };
