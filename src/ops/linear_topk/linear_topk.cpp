@@ -118,11 +118,18 @@ void require_w8(const Weight& head) {
     const bool common =
         head.qtype == QType::W8G32_F16S && head.layout == QuantLayout::RowSplit &&
         head.scale_dtype == DType::FP16 && head.group_size == 32 && head.group == 32 &&
-        head.ndim == 2 && head.n == detail::kLinearTopKFullRows &&
+        head.ndim == 2 &&
+        (head.n == detail::kLinearTopKFullRows ||
+         head.n == detail::kLinearTopKFullRows / 2) &&   // tp2 行分片头
         head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
+    // tp2 的行分片头：每卡 kLinearTopKFullRows/2 行，其余形状约定相同。
+    const bool shard_rows = head.n == detail::kLinearTopKFullRows / 2;
     if (!common) { throw std::invalid_argument("linear_topk: invalid W8 full head"); }
+    if (shard_rows && (head.shape[0] != head.n || head.padded_shape[0] != head.n)) {
+        throw std::invalid_argument("linear_topk: invalid W8 sharded head");
+    }
 }
 
 void require_q4(const Weight& head) {
