@@ -49,12 +49,18 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                             k == 8704);      // 17408  / 2 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_w8_simt_r8_c4; }
-    // 5060Ti 实测（ninfer_linear_bench --qtype w8，124160x5120）：t∈[5,16] 时
-    // mma_r64x16 比 simt_c8 快 38%/19%（t=5：1843µs vs 2990µs；t=8：1851µs vs 2276µs）。
-    // 上游的 SIMT 小宽度表是按 5090 的带宽/算力比调的；其余 shard 形状维持 simt_c8（实测仍最优）。
-    if (t <= 16) {
-        return n == 124160 ? launch_w8_mma_r64x16_c48_k128_a1 : launch_w8_simt_r8_c8;
-    }
+    // 5060Ti 实测（ninfer_linear_bench --qtype w8）：t∈[5,16] 时 shard 形状几乎全部由
+    // mma_r64x16 胜出（t=5/8/12/16，单位 µs，simt_c8 → mma_r64x16）：
+    //   7168x5120   200→160  168→160  380→168  311→174
+    //   17408x5120  444→313  354→315  870→320  674→325
+    //   3072x5120   102→86    90→86   184→89   148→90
+    //   5120x3072    94→80    82→83   175→84   139→92
+    //   5120x5120   151→129  127→131  281→135  229→139
+    //   5120x8704   285→215  256→225  533→240  455→243
+    //   124160x5120                       （lm_head 前一轮已改 mma_r64x16）
+    // 唯一的例外是 n==512（gdn 的 kv 列片）：36→55 / 34→55 / 43→57 / 44→57，simt_c8 完胜。
+    // 上游的 SIMT 小宽度表是按 5090 的带宽/算力比调的；5060Ti 上 mma 在 t≥5 全面反超。
+    if (t <= 16) { return n == 512 ? launch_w8_simt_r8_c8 : launch_w8_mma_r64x16_c48_k128_a1; }
     return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
 }
 
