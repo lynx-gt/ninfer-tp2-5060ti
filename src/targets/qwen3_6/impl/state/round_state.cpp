@@ -325,6 +325,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     // 本 fork 的 DFlash2 提案路径要用它，必须绑上，否则是野张量。
     proposal_valid_columns =
         ingress_tensor(offsetof(DFlashDecodeIngress, proposal_valid_columns), DType::I32, {batch});
+    // 上游 master 有这一行，本 fork 合并时漏了：DFlash 验证的续接 RoPE 位置（多模态行要靠
+    // rope_delta 单独给），漏绑就是 dtype/shape 都不对的野张量。
+    target_rope_positions = ingress_tensor(offsetof(DFlashDecodeIngress, target_rope_positions),
+                                           DType::I32, {width, batch});
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =

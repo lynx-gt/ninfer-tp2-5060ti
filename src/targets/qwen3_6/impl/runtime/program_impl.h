@@ -1579,18 +1579,25 @@ void ProgramImplCore::prepare_graphs() {
             *dflash_host_ingress       = {};
             *dflash_host_egress        = {};
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
+            // 物理宽度 W = 可验证草稿数 K + 1：上游 master 这里用的是 draft_window+1，而不是
+            // 被 capacity 截过的 extent+1 —— 图捕获的宽度必须等于运行期宽度。
+            const std::uint32_t width = draft_window + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash frontier");
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
-                // 物理宽度 W = 可验证草稿数 K + 1（本函数里 K = extent）
                 dflash_host_ingress->proposal_valid_columns[row] =
-                    static_cast<std::int32_t>(extent + 1U);
+                    static_cast<std::int32_t>(width);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
+                for (std::uint32_t column = 0; column < width; ++column) {
+                    dflash_host_ingress->target_rope_positions[row * width + column] =
+                        checked_i32(frontier + std::min(column, extent),
+                                    "graph representative DFlash target RoPE position");
+                }
                 dflash_host_ingress->text_kv_table_rows[row]   = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 dflash_host_ingress->active_lanes[row]                = static_cast<std::int32_t>(row);
@@ -2722,6 +2729,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+            // 上游 master 有这段：DFlash 验证用自己的 RoPE 位置（含每序列 rope_delta），
+            // 本 fork 合并时漏了 —— 漏填就是读到未初始化值。
+            for (std::uint32_t column = 0; column < width; ++column) {
+                const std::uint32_t position = frontier + std::min(column, extent);
+                dflash_host_ingress->target_rope_positions[row * width + column] =
+                    checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
+            }
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
             dflash_host_ingress->active_lanes[row]    = static_cast<std::int32_t>(sequence.lane);
