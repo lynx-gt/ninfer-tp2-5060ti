@@ -2757,7 +2757,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             dflash_host_ingress->active_lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
+            materialize_sequence_kv(sequence, frontier + extent + 1U,
+                                    backend_kv_cache() != nullptr ? frontier : 0U);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
