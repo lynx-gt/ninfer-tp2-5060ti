@@ -2778,9 +2778,16 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             static int dbg_round = 0;
             if (dbg_round < 8) {
                 ++dbg_round;
-                std::fprintf(stderr, "[dbg] round %d accepted=%d licensed=%d\n", dbg_round,
+                std::vector<std::int32_t> drafts(static_cast<std::size_t>(draft_window), -1);
+                CUDA_CHECK(cudaMemcpy(drafts.data(), io.dflash_decode->draft_tokens.data,
+                                      drafts.size() * 4, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "[dbg] round %d accepted=%d licensed=%d drafts=", dbg_round,
                              dflash_host_egress->accepted_drafts[0],
                              dflash_host_egress->licensed_counts[0]);
+                for (std::size_t i = 0; i < drafts.size(); ++i) {
+                    std::fprintf(stderr, " %d", drafts[i]);
+                }
+                std::fprintf(stderr, "\n");
             }
         }
 
