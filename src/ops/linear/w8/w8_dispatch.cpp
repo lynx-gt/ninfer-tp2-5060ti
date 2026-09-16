@@ -49,7 +49,12 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                             k == 8704);      // 17408  / 2 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
     if (t <= 4) { return launch_w8_simt_r8_c4; }
-    if (t <= 16) { return launch_w8_simt_r8_c8; }
+    // 5060Ti 实测（ninfer_linear_bench --qtype w8，124160x5120）：t∈[5,16] 时
+    // mma_r64x16 比 simt_c8 快 38%/19%（t=5：1843µs vs 2990µs；t=8：1851µs vs 2276µs）。
+    // 上游的 SIMT 小宽度表是按 5090 的带宽/算力比调的；其余 shard 形状维持 simt_c8（实测仍最优）。
+    if (t <= 16) {
+        return n == 124160 ? launch_w8_mma_r64x16_c48_k128_a1 : launch_w8_simt_r8_c8;
+    }
     return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
 }
 
