@@ -2781,7 +2781,30 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       draft_window, envelopes, target_envelope, executable);
         device.synchronize();
 
-        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        {
+            // [dbg] 草稿 vs 目标：draft_tokens 是 [W-1, batch]，target_argmax 是 [W, batch]。
+            // 每行只印第 0 号 lane 的列，够看清对齐关系。
+            std::array<std::int32_t, 16> dbg_drafts{};
+            std::array<std::int32_t, 16> dbg_argmax{};
+            CUDA_CHECK(cudaMemcpy(dbg_drafts.data(), io.dflash_decode->draft_tokens.data,
+                                  draft_window * static_cast<std::size_t>(sizeof(std::int32_t)),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(dbg_argmax.data(), io.dflash_decode->target_argmax.data,
+                                  (draft_window + 1U) *
+                                      static_cast<std::size_t>(sizeof(std::int32_t)),
+                                  cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "[dbg] drafts=");
+            for (std::uint32_t j = 0; j < draft_window; ++j) {
+                std::fprintf(stderr, "%d,", dbg_drafts[j]);
+            }
+            std::fprintf(stderr, " argmax=");
+            for (std::uint32_t j = 0; j <= draft_window; ++j) {
+                std::fprintf(stderr, "%d,", dbg_argmax[j]);
+            }
+            std::fprintf(stderr, " acc=%d cnt=%d\n", dflash_host_egress->accepted_drafts[0],
+                         dflash_host_egress->licensed_counts[0]);
+        }
+
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
