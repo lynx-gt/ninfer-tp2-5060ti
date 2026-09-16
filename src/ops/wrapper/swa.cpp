@@ -37,7 +37,9 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        // DFlash2 草稿的滑窗容量是 2048（其 checkpoint 的 sliding_window），35B 用 4096。
+        (context.capacity != 2048 && context.capacity != kWindow) ||
+        context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
