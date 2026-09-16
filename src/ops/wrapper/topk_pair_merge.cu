@@ -55,14 +55,18 @@ __global__ void topk_pair_merge_kernel(const std::int32_t* __restrict__ ids_a,
         best_ids[slot]    = id;
     };
 
+    // 本引擎的 Tensor 是 dim-0 最快（见 rmsnorm_pack_tail 契约 "Dimension zero is stored
+    // fastest"），所以 [16,columns] 的扁平下标是 rank + 16*column，不是 C 行主序的
+    // rank*columns+column。用错步长就会把候选矩阵读/写成错位内容（实测同一列里会出现重复 id），
+    // selector 拿到的候选表因此是坏的。
     for (int row = 0; row < kTopK; ++row) {
-        const std::int32_t index = row * columns + column;
+        const std::int32_t index = row + kTopK * column;
         consider(ids_a[index], scores_a[index]);
         // 第二张头的行号是卡内行号，先搬到全局行号再比，否则同分次序和输出 id 都错。
         consider(ids_b[index] + remote_id_offset, scores_b[index]);
     }
     for (int row = 0; row < kTopK; ++row) {
-        const std::int32_t index = row * columns + column;
+        const std::int32_t index = row + kTopK * column;
         ids_out[index]           = best_ids[row];
         scores_out[index]        = best_scores[row];
     }
