@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -95,6 +96,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
+        // [dbg] 定向实验开关：设了 NINFER_DFLASH_NOCTX 就整段跳过上下文写入，
+        // 用来判断草稿到底有没有吃到 target 特征（接受率不变=根本没吃到）。
+        if (std::getenv("NINFER_DFLASH_NOCTX") != nullptr) { return; }
         using Config               = typename V::DFlashConfig;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
