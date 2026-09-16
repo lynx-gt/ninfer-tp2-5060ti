@@ -331,8 +331,15 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         if (tp && state.execution.proposal_head == ProposalHead::Full) {
             const auto peer_valid = full_valid - local_valid;
             if (peer_valid > 0) {
-                // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
+                // 跨卡这段是手工排的，没有集合通信帮忙排序，必须自己用事件把两条流串起来，
+                // 否则（1）rank1 拷 hidden 时 rank0 还没算完、（2）rank0 拷候选时 rank1 还没算完，
+                // 两个方向都会读到上一轮的残留 —— 实测漏掉时 rank1 候选整片读到 0，草稿大面积失配。
+                // 事件用 PeerEvents 的 inputs_ready：语义就是"某卡的数据已就绪"，与集合通信同一套
+                // 复用纪律（先发 wait 再发 record）。
+                CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
                 CUDA_CHECK(cudaSetDevice(tp->device->device));
+                CUDA_CHECK(cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
+                // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
                 Tensor peer_hidden = tp->work->alloc(DType::BF16, {Config::hidden, mask_columns});
                 Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
                 Tensor peer_scores = tp->work->alloc(DType::FP32, {16, mask_columns});
@@ -341,7 +348,9 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 auto peer_scope = tp->work->scope();
                 ops::linear_topk(peer_hidden, tp->weights->output_head, peer_valid, peer_ids,
                                  peer_scores, *tp->work, tp->device->stream);
+                CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(1), tp->device->stream));
                 CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+                CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
                 // 把 rank 1 的候选搬到 rank 0（peer 访问已在构造时打开），再合并
                 Tensor remote_ids    = work.alloc(DType::I32, {16, mask_columns});
                 Tensor remote_scores = work.alloc(DType::FP32, {16, mask_columns});
