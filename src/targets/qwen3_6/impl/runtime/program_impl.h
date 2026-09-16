@@ -2151,7 +2151,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
                                          prefill_hidden, prefill_chunk, proposal_head,
-                                         rope_frequency},
+                                         rope_frequency, peer_core ? &*peer_core : nullptr},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -2776,7 +2776,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, rope_frequency},
+                                                     proposal_head, rope_frequency,
+                                                     peer_core ? &*peer_core : nullptr},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
