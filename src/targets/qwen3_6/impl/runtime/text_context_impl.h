@@ -1418,7 +1418,8 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     if (tp2()) {
-        throw std::logic_error("DFlash prefill has no tensor-parallel path in this build");
+        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), text_prefill, sink,
+                                finalize_at_end);
     }
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
@@ -1958,6 +1959,14 @@ void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
                                                  bool finalize_at_end) {
+    NullTap tap;
+    return prefill_impl_tp2(ids, text_prefill, tap, finalize_at_end);
+}
+
+template <class Tap>
+PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
+                                                 const TextPrefill& text_prefill, Tap& tap,
+                                                 bool finalize_at_end) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -2025,6 +2034,8 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             ops::fill_i32_positions(positions[r], base_i, s);
             ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_, x[r], s);
         });
+        // DFlash2 的提示特征：只取 rank 0（残差在两卡上逐位相同，草稿只在 rank 0 上跑）。
+        if constexpr (Tap::enabled) { tap.begin(x[0]); }
 
         ScopedValue<const Tensor*> peer_cache(peer_cache_positions_, &positions[1]);
         ScopedValue<const Tensor*> peer_rope(peer_rope_positions_, &positions[1]);
@@ -2036,7 +2047,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging);
+        run_layers_tp2(x, Phase::Prefill, staging, tap);
+        if constexpr (requires { tap.capture_positions(positions[0], stream_for(0)); }) {
+            tap.capture_positions(positions[0], stream_for(0));
+        }
 
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
@@ -2164,6 +2178,12 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                        checkpoint_hidden.data, checkpoint_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, ctx_.stream));
         }
+    }
+
+    if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+        work_.reset();
+        tp_->work->reset();
+        tap.consume_prefill_chunk(len, checkpoint_rel > 0 && len == checkpoint_rel);
     }
 
     if (checkpoint_rel > 0 && len == checkpoint_rel) {

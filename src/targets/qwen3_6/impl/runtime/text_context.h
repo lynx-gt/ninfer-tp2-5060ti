@@ -509,6 +509,11 @@ private:
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                       const TextPrefill& text_prefill,
                                                       bool finalize_at_end);
+    // DFlash2 的 feature tap 版本（见 run_layers_tp2 的说明：只捕获 rank 0）。
+    template <class Tap>
+    [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
+                                                      const TextPrefill& text_prefill, Tap& tap,
+                                                      bool finalize_at_end);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
