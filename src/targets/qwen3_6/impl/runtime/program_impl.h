@@ -2818,18 +2818,18 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             for (std::uint32_t i = 0; i < draft_window; ++i) {
                 std::fprintf(stderr, "[dbg] col%u:", i);
                 for (int c = 0; c < 16; ++c) {
-                    std::fprintf(stderr, " %d", dbg_all[c * draft_window + i]);
+                    std::fprintf(stderr, " %d", dbg_all[i * 16 + c]);
                 }
                 // 目标 argmax[i]（预测位置 i+1 的真值）是否在该列的候选集里
                 bool present = false;
                 for (int c = 0; c < 16; ++c) {
-                    if (dbg_all[c * draft_window + i] == dbg_argmax[i]) { present = true; }
+                    if (dbg_all[i * 16 + c] == dbg_argmax[i]) { present = true; }
                 }
                 // 选出来的 draft 是否在该列的候选集里（选择的合法性自检）
                 bool picked_in_set = false;
                 int picked_rank    = -1;
                 for (int c = 0; c < 16; ++c) {
-                    if (dbg_all[c * draft_window + i] == dbg_drafts[i]) {
+                    if (dbg_all[i * 16 + c] == dbg_drafts[i]) {
                         picked_in_set = true;
                         picked_rank   = c;
                     }
@@ -2839,7 +2839,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 if (io.dflash_decode->proposal_q.data != nullptr) {
                     float best = -1.0f;
                     for (int c = 0; c < 16; ++c) {
-                        const float q = dbg_q[c * draft_window + i];
+                        const float q = dbg_q[i * 16 + c];
                         if (q > best) { best = q; q_argmax = c; }
                     }
                 }
