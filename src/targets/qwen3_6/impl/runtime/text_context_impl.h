@@ -1418,7 +1418,8 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     if (tp2()) {
-        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), text_prefill, sink,
+        const TextPrefill tp2_prefill{full_ids, begin};
+        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), tp2_prefill, sink,
                                 finalize_at_end);
     }
     const TextPrefill text_prefill{full_ids, begin};
