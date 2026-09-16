@@ -317,6 +317,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         Tensor scores     = work.alloc(DType::FP32, {16, mask_columns});
         // tp2：词表头按行分片（每卡 124160 行），草稿的候选选择必须取到**全局** top-16：
         // 两卡各在自己那半词表上取 top-16，再把两路合并（分数降序、同分取更小 token id）。
+        std::optional<TpExecution> tp = tp_execution(state.execution);
         const std::int32_t full_valid = TextConfig::token_domain;
         const std::int32_t shard_rows = state.execution.model.output_head.n;
         const std::int32_t local_valid = tp ? std::min(full_valid, shard_rows) : full_valid;
