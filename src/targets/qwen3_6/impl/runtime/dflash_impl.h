@@ -353,8 +353,32 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 // rank 1 的候选 id 是它自己半张头里的行号（0..shard_rows-1），必须加上那半张
                 // 词表的全局起点才是全局 token id。实测漏掉这一步时接受长度只有 1.4 tok/轮
                 // （SGLang 同配置 3.5+），因为半个词表的候选全指到了错的 token 上。
-                ops::topk_pair_merge(ids_flat, scores, remote_ids, remote_scores, ids_flat, scores,
-                                     shard_rows, stream);
+                {
+                    // [dbg] 两卡原始候选 id（第 0 列）与合并结果，用来确认行号语义。
+                    std::int32_t dbg_a[32] = {};
+                    std::int32_t dbg_b[32] = {};
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    CUDA_CHECK(cudaMemcpy(dbg_a, ids_flat.data, sizeof(dbg_a),
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(dbg_b, remote_ids.data, sizeof(dbg_b),
+                                          cudaMemcpyDeviceToHost));
+                    std::int32_t dbg_m[32] = {};
+                    std::fprintf(stderr, "[dbg] a=");
+                    for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%d,", dbg_a[i]); }
+                    std::fprintf(stderr, " b=");
+                    for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%d,", dbg_b[i]); }
+                    std::fprintf(stderr, " shard=%d
+", shard_rows);
+                    ops::topk_pair_merge(ids_flat, scores, remote_ids, remote_scores, ids_flat,
+                                         scores, shard_rows, stream);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    CUDA_CHECK(cudaMemcpy(dbg_m, ids_flat.data, sizeof(dbg_m),
+                                          cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr, "[dbg] merged=");
+                    for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%d,", dbg_m[i]); }
+                    std::fprintf(stderr, "
+");
+                }
             }
         }
         Tensor projected = work.alloc(DType::BF16, {256, mask_columns});
