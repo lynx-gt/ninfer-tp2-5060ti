@@ -1,9 +1,30 @@
 #include "ops/linear/w8/w8_dispatch.h"
 #include "ops/linear/w8/w8_feature.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+// 临时测量钩子：NINFER_W8_FORCE=<名字> 强制选核（5060Ti 重测 small-t 路由用；定版后移除）
+static W8Launch forced_w8_launch() {
+    const char* force = std::getenv("NINFER_W8_FORCE");
+    if (force == nullptr || force[0] == '\0') { return nullptr; }
+    struct Entry { const char* name; W8Launch launch; };
+    static constexpr Entry kEntries[] = {
+        {"simt_c4", launch_w8_simt_r8_c4},   {"simt_c8", launch_w8_simt_r8_c8},
+        {"small_t", launch_w8_small_t},       {"decode_r4", launch_w8_decode_r4},
+        {"mma_r32_c64", launch_w8_mma_r32_c64}, {"mma_r32_c128", launch_w8_mma_r32_c128},
+        {"mma_r64_c96", launch_w8_mma_r64_c96}, {"mma_r64_c128", launch_w8_mma_r64_c128},
+        {"mma_r64x16", launch_w8_mma_r64x16_c48_k128_a1},
+        {"mma_r64x32", launch_w8_mma_r64x32_c64_k128_a1},
+    };
+    for (const Entry& e : kEntries) {
+        if (std::strcmp(force, e.name) == 0) { return e.launch; }
+    }
+    throw std::invalid_argument("NINFER_W8_FORCE: unknown w8 kernel name");
+}
 
 // TP2 shard geometries：W8 的 small-T 表是编译期精确几何，shard 走通用 SIMT/MMA launcher。
 // (n,k) 不是已登记的 shard extent 时返回 nullptr。
@@ -27,6 +48,7 @@ W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
 // tp1 表优先；未命中再查 tp2 shard 表；都不命中才报错。
 W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
+    if (const W8Launch forced = forced_w8_launch()) { return forced; }
     if (const W8Launch tp1 = select_w8_a16_registered(n, k, t); tp1 != nullptr) { return tp1; }
     if (const W8Launch shard = select_w8_tp2_shard_launch(n, k, t); shard != nullptr) { return shard; }
     throw std::invalid_argument("w8 linear: unsupported shape or T");
