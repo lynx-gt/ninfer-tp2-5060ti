@@ -340,9 +340,15 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 // 两个方向都会读到上一轮的残留 —— 实测漏掉时 rank1 候选整片读到 0，草稿大面积失配。
                 // 事件用 PeerEvents 的 inputs_ready：语义就是"某卡的数据已就绪"，与集合通信同一套
                 // 复用纪律（先发 wait 再发 record）。
-                CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
+                // [dbg] 定向实验：临时关掉跨卡事件同步，验证它是否污染了 verify 的集合通信排序。
+                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
+                    CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
+                }
                 CUDA_CHECK(cudaSetDevice(tp->device->device));
-                CUDA_CHECK(cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
+                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
+                    CUDA_CHECK(
+                        cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
+                }
                 // rank 1：用它自己那半头、在拷过去的同一份 hidden 上取 top-16
                 Tensor peer_hidden = tp->work->alloc(DType::BF16, {Config::hidden, mask_columns});
                 Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
@@ -352,9 +358,13 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 auto peer_scope = tp->work->scope();
                 ops::linear_topk(peer_hidden, tp->weights->output_head, peer_valid, peer_ids,
                                  peer_scores, *tp->work, tp->device->stream);
-                CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(1), tp->device->stream));
+                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
+                    CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(1), tp->device->stream));
+                }
                 CUDA_CHECK(cudaSetDevice(state.execution.device.device));
-                CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
+                if (std::getenv("NINFER_DFLASH_NOEV") == nullptr) {
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
+                }
                 // 把 rank 1 的候选搬到 rank 0（peer 访问已在构造时打开），再合并
                 Tensor remote_ids    = work.alloc(DType::I32, {16, mask_columns});
                 Tensor remote_scores = work.alloc(DType::FP32, {16, mask_columns});
