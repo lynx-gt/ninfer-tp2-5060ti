@@ -1,5 +1,7 @@
 #include "core/tensor.h"
 
+#include <cstdio>
+
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -101,6 +103,10 @@ Tensor Tensor::view(std::initializer_list<std::int32_t> shape) const {
 
     const auto normalized = normalize_shape(shape);
     if (shape_numel(normalized) != numel()) {
+        std::fprintf(stderr, "[dbg] view mismatch: have=%lld,%lld,%lld,%lld want=%d,%d,%d,%d
+",
+                     (long long)ne[0], (long long)ne[1], (long long)ne[2], (long long)ne[3],
+                     normalized[0], normalized[1], normalized[2], normalized[3]);
         throw std::invalid_argument("view element count mismatch");
     }
 
