@@ -350,8 +350,11 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 CUDA_CHECK(cudaMemcpyAsync(remote_scores.data, peer_scores.data,
                                            remote_scores.bytes(), cudaMemcpyDeviceToDevice,
                                            stream));
+                // rank 1 的候选 id 是它自己半张头里的行号（0..shard_rows-1），必须加上那半张
+                // 词表的全局起点才是全局 token id。实测漏掉这一步时接受长度只有 1.4 tok/轮
+                // （SGLang 同配置 3.5+），因为半个词表的候选全指到了错的 token 上。
                 ops::topk_pair_merge(ids_flat, scores, remote_ids, remote_scores, ids_flat, scores,
-                                     stream);
+                                     shard_rows, stream);
             }
         }
         Tensor projected = work.alloc(DType::BF16, {256, mask_columns});

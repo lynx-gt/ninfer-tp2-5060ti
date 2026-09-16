@@ -18,7 +18,8 @@ __global__ void topk_pair_merge_kernel(const std::int32_t* __restrict__ ids_a,
                                        const std::int32_t* __restrict__ ids_b,
                                        const float* __restrict__ scores_b,
                                        std::int32_t* __restrict__ ids_out,
-                                       float* __restrict__ scores_out, std::int32_t columns) {
+                                       float* __restrict__ scores_out, std::int32_t columns,
+                                       std::int32_t remote_id_offset) {
     const std::int32_t column = blockIdx.x * blockDim.x + threadIdx.x;
     if (column >= columns) { return; }
 
@@ -57,7 +58,8 @@ __global__ void topk_pair_merge_kernel(const std::int32_t* __restrict__ ids_a,
     for (int row = 0; row < kTopK; ++row) {
         const std::int32_t index = row * columns + column;
         consider(ids_a[index], scores_a[index]);
-        consider(ids_b[index], scores_b[index]);
+        // 第二张头的行号是卡内行号，先搬到全局行号再比，否则同分次序和输出 id 都错。
+        consider(ids_b[index] + remote_id_offset, scores_b[index]);
     }
     for (int row = 0; row < kTopK; ++row) {
         const std::int32_t index = row * columns + column;
@@ -78,7 +80,7 @@ void require_matrix(const Tensor& tensor, DType dtype, std::int32_t columns, con
 
 void topk_pair_merge(const Tensor& ids_a, const Tensor& scores_a, const Tensor& ids_b,
                      const Tensor& scores_b, Tensor& ids_out, Tensor& scores_out,
-                     cudaStream_t stream) {
+                     std::int32_t remote_id_offset, cudaStream_t stream) {
     const std::int32_t columns = ids_a.ne[1];
     if (columns <= 0 || ids_a.ne[0] != kTopK) {
         throw std::invalid_argument("topk_pair_merge: invalid candidate geometry");
@@ -95,7 +97,8 @@ void topk_pair_merge(const Tensor& ids_a, const Tensor& scores_a, const Tensor& 
     topk_pair_merge_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids_a.data), static_cast<const float*>(scores_a.data),
         static_cast<const std::int32_t*>(ids_b.data), static_cast<const float*>(scores_b.data),
-        static_cast<std::int32_t*>(ids_out.data), static_cast<float*>(scores_out.data), columns);
+        static_cast<std::int32_t*>(ids_out.data), static_cast<float*>(scores_out.data), columns,
+        remote_id_offset);
     CUDA_CHECK(cudaGetLastError());
 }
 
