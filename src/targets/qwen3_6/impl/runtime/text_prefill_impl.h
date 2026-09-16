@@ -27,18 +27,8 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
             if (rewrite_checkpoint) {
-                const std::int32_t checkpoint_lane =
-                    static_cast<std::int32_t>(state.dflash_host_ingress->active_lanes[0]);
-                state.dflash->save_rewrite_checkpoint(checkpoint_lane,
+                state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->active_lanes[0],
                                                       state.execution.device.stream);
-                // TP2：草稿窗口每卡一份（各自半头），检查点也必须两卡一起存，否则复用回退时
-                // rank 1 的 4 个头没有可回退的窗口。
-                if (const std::optional<TpExecution> tp = tp_execution(state.execution);
-                    tp && tp->dflash) {
-                    CUDA_CHECK(cudaSetDevice(tp->device->device));
-                    tp->dflash->save_rewrite_checkpoint(checkpoint_lane, tp->device->stream);
-                    CUDA_CHECK(cudaSetDevice(state.execution.device.device));
-                }
             }
         });
 }

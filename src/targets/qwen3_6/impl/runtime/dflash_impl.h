@@ -140,57 +140,6 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                                         ? features.slice(1, local_offset, local_width)
                                         : features;
 
-        // TP2：草稿按头分片，每卡用自己的 context_key/value shard 与自己的 local cache 物化
-        // 本卡那半 KV。feature_projection/context_norm 是复制权重，两卡各算一份，输入相同 ⇒
-        // 结果逐位相同；context_kv_materialize 只读 context 与本卡权重、只写本卡 cache。
-        if (const std::optional<TpExecution> tp = tp_execution(state.execution)) {
-            if constexpr (Config::coherent_selector) {
-                if (!tp->dflash) {
-                    throw std::logic_error(
-                        "tensor-parallel DFlash2 append requires a peer draft state");
-                }
-                const Tensor local_positions = replace_local_window
-                                                   ? positions.slice(0, local_offset, local_width)
-                                                   : positions;
-                std::array<WorkspaceArena*, 2> works = {&state.execution.work, tp->work};
-                std::array<const LoadedModelData*, 2> models = {&state.execution.model,
-                                                                tp->weights};
-                DFlashPersistentState* states[2] = {&dflash_state(state), tp->dflash};
-                std::array<Tensor, 2> projected2;
-                std::array<Tensor, 2> context2;
-                std::array<WorkspaceArena::Scope, 2> scopes = {works[0]->scope(),
-                                                               works[1]->scope()};
-                for_each_rank(*tp->execution, [&](int rank) {
-                    const auto r      = static_cast<std::size_t>(rank);
-                    cudaStream_t s    = tp->execution->dev[rank]->stream;
-                    const auto roots  = workspace_recipe::dflash_context<Config>(
-                        *works[r], projected_width * batch);
-                    projected2[r] = roots.projected;
-                    context2[r]   = roots.normalized;
-                    ops::linear(input.view({Config::feature_rows, projected_width * batch}),
-                                models[r]->dflash->feature_projection, projected2[r], s);
-                    ops::rmsnorm(projected2[r], models[r]->dflash->context_norm,
-                                 Config::rms_epsilon, false, context2[r], s);
-                });
-                for_each_rank(*tp->execution, [&](int rank) {
-                    const auto r    = static_cast<std::size_t>(rank);
-                    cudaStream_t s  = tp->execution->dev[rank]->stream;
-                    std::array<ops::ContextKVMaterializeLayerView, Config::layers> layers;
-                    for (int layer = 0; layer < Config::layers; ++layer) {
-                        const auto& weights = models[r]->dflash->layers[layer];
-                        layers[layer]       = {weights.context_key, weights.context_value,
-                                               weights.key_norm,
-                                               states[r]->local_layer(layer)};
-                    }
-                    ops::context_kv_materialize(
-                        context2[r].view({Config::hidden, local_width, batch}), local_positions,
-                        local_counts, lanes, layers,
-                        {local_envelope.min_count, local_envelope.max_count}, *works[r], s);
-                });
-                return;
-            }
-        }
-
         const auto roots =
             workspace_recipe::dflash_context<Config>(state.execution.work, projected_width * batch);
         Tensor projected = roots.projected;
@@ -378,13 +327,20 @@ void dflash2_select_candidates(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                                  drafts, proposal_q, work, stream);
 }
 
-// DFlash2 草稿的 TP2 前传：权重按头/块分片（bindings.cpp 的 dflash2 规则），两卡各跑自己那半，
-// 每层两次 allreduce（attention/output 与 mlp/down 的行并行投影），卷积+残差 tail 在两卡各自
-// 复制执行。
+// DFlash2 草稿的 TP2 分片：**只分 MLP**。
 //
-// 数值合规性：草稿只产提案，接受由 target 验证决定，因此草稿侧的浮点重排/分片只影响接受率、
-// 不影响输出内容。两卡 residual 经 allreduce 后逐位相同（IEEE 加法交换律），其后所有复制计算
-// 保持逐位一致，草稿候选在两卡上按构造相同。
+// - attention 段（qkv 投影 / 滑窗 attention / attention-output 投影 + 卷积残差）在 rank 0 上
+//   原样运行，与单卡路径逐行一致：草稿的滑窗 KV 因此只有 rank 0 一份，它的 append / 检查点 /
+//   清零全部保持单卡语义。做成两卡各持一份会引入 append 路径的跨卡读（rank 1 读 rank 0 的
+//   compact_features，需要事件排序且白费 P2P 带宽），实测第 2 轮起两卡 cache 分叉、草稿全废。
+// - MLP 段的两次投影（gate_up 列并、down 行并）在两卡上分片执行，各承担一半权重流量；
+//   allreduce 之后两卡拿到逐位相同的残差，rank 1 于是能用自算 hidden 参与半词表 top-16
+//   （省掉 82KB 的 hidden 拷贝与一对事件）。
+// - 每层在 MLP 段之前把 rank 0 的残差逐位拷给 rank 1：这是两卡 lockstep 唯一的跨卡数据流
+//   （5120×W×B BF16，W=8 时 82KB），attention 段留在 rank 0 的代价就是这一份拷贝。
+//
+// 数值合规性：草稿只产提案、接受由 target 验证决定，因此草稿侧的浮点重排（gate_up/down 的
+// 半孪生 partial 求和位置）只影响接受率、不影响输出内容。
 template <class V>
 void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
                                const TpExecution& tp, int batch, int k, DFlashEnvelopes envelopes) {
@@ -394,97 +350,97 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     using DFlashWeights = typename V::ModelView::DFlash;
     static_assert(Config::layers == Config::local_layers,
                   "DFlash2 TP2 前传只实现了全 local 层的草稿");
-    if (!tp.dflash) {
-        throw std::logic_error("tensor-parallel DFlash2 proposal requires a peer draft state");
-    }
-    const ExecutionContext& ec      = *tp.execution;
-    WorkspaceArena* work[2]         = {&state.execution.work, tp.work};
-    DeviceContext* device[2]        = {&state.execution.device, tp.device};
-    const LoadedModelData* runtime[2]     = {&state.execution.model, tp.weights};
-    qwen3_6::DFlashDecodeState* frames[2] = {&frame, &*tp.io->dflash_decode};
-    DFlashPersistentState* draft_state[2] = {&dflash_state(state), tp.dflash};
-    const DFlashWeights* weights[2]       = {&*state.execution.model.dflash,
-                                             &*tp.weights->dflash};
+    static_assert(Config::intermediate % 2 == 0, "DFlash2 TP2 需要偶数 intermediate");
+    const ExecutionContext& ec           = *tp.execution;
+    WorkspaceArena* work[2]              = {&state.execution.work, tp.work};
+    DeviceContext* device[2]             = {&state.execution.device, tp.device};
+    const LoadedModelData* runtime[2]    = {&state.execution.model, tp.weights};
+    const DFlashWeights* weights[2]      = {&*state.execution.model.dflash,
+                                            &*tp.weights->dflash};
 
     const int width        = k + 1;
     const int columns      = width * batch;
     const int mask_columns = k * batch;
-    static_assert(Config::intermediate % 2 == 0, "DFlash2 TP2 需要偶数 intermediate");
 
-    // ---- 每卡自己的 frame 展开 + 嵌入（同一份 ingress 各卡独立展开，结果逐位相同）----
-    std::array<Tensor, 2> residual;
-    for_each_rank(ec, [&](int rank) {
-        const auto r    = static_cast<std::size_t>(rank);
-        cudaStream_t s  = device[rank]->stream;
-        auto& f         = *frames[r];
-        Tensor anchors  = f.anchors.slice(0, 0, batch);
-        Tensor frontiers = f.execution_frontiers.slice(0, 0, batch);
-        Tensor valid    = f.proposal_valid_columns.slice(0, 0, batch);
-        Tensor ids      = f.proposal_ids.slice(1, 0, batch);
-        Tensor positions = f.proposal_positions.slice(1, 0, batch);
-        work[r]->reset();
-        ops::prepare_masked_block(anchors, frontiers, valid, Config::mask_token, ids, positions,
-                                  s);
-        residual[r] = work[r]->alloc(DType::BF16, {Config::hidden, width, batch});
-        Tensor flat_residual = residual[r].view({Config::hidden, columns});
-        ops::embedding(ids.view({columns}), runtime[rank]->token_embedding, flat_residual, s);
-    });
+    // ---- 草稿输入只有 rank 0 一份：frame 展开 + 嵌入，两卡各自的残差缓冲 ----
+    work[0]->reset();
+    work[1]->reset();
+    Tensor anchors   = frame.anchors.slice(0, 0, batch);
+    Tensor frontiers = frame.execution_frontiers.slice(0, 0, batch);
+    Tensor valid     = frame.proposal_valid_columns.slice(0, 0, batch);
+    Tensor ids       = frame.proposal_ids.slice(1, 0, batch);
+    Tensor positions = frame.proposal_positions.slice(1, 0, batch);
+    ops::prepare_masked_block(anchors, frontiers, valid, Config::mask_token, ids, positions,
+                              device[0]->stream);
+    Tensor residual0 = work[0]->alloc(DType::BF16, {Config::hidden, width, batch});
+    Tensor residual1 = work[1]->alloc(DType::BF16, {Config::hidden, width, batch});
+    Tensor flat_residual = residual0.view({Config::hidden, columns});
+    ops::embedding(ids.view({columns}), runtime[0]->token_embedding, flat_residual,
+                   device[0]->stream);
+    // 第 0 层的 attention 段之前两卡必须从同一份残差出发：把嵌入结果也拷给 rank 1。
+    CUDA_CHECK(cudaEventRecord(tp.events->inputs_ready(0), device[0]->stream));
+    CUDA_CHECK(cudaSetDevice(device[1]->device));
+    CUDA_CHECK(cudaStreamWaitEvent(device[1]->stream, tp.events->inputs_ready(0), 0));
+    CUDA_CHECK(cudaMemcpyAsync(residual1.data, residual0.data, residual0.bytes(),
+                               cudaMemcpyDeviceToDevice, device[1]->stream));
+    CUDA_CHECK(cudaSetDevice(device[0]->device));
 
-    for (std::size_t layer_index = 0; layer_index < Config::layers; ++layer_index) {
+    for (std::size_t layer_index = 0; layer_index < static_cast<std::size_t>(Config::layers);
+         ++layer_index) {
         nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
                                       layer_index);
-        // ---- attention 分支：qkv / 滑窗 attention / attention/output 全部**复制**运行，
-        // 与单卡路径逐行同构（两卡各自算同一份结果）。只有 MLP 分支分片。 ----
+        // ---- attention 段：rank 0 原样跑（与单卡路径同构），滑窗 KV 只此一份 ----
         {
-            std::array<WorkspaceArena::Scope, 2> scopes = {work[0]->scope(), work[1]->scope()};
-            for_each_rank(ec, [&](int rank) {
-                const auto r      = static_cast<std::size_t>(rank);
-                cudaStream_t s    = device[rank]->stream;
-                auto& f           = *frames[r];
-                const auto& layer = weights[r]->layers[layer_index];
-                auto branch = workspace_recipe::dflash2_branch<Config>(*work[r], width, batch);
-                prepare_dynamic_branch(*device[r], *work[r], residual[r], layer.input_norm,
-                                       Config::rms_epsilon, layer.attention_conv, branch);
-                Tensor query = work[r]->alloc(
-                    DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
-                Tensor key = work[r]->alloc(
-                    DType::BF16, {Config::head_dim, Config::kv_heads, width, batch});
-                Tensor value = work[r]->alloc(
-                    DType::BF16, {Config::head_dim, Config::kv_heads, width, batch});
-                Tensor query_flat = query.view({Config::query_size, columns});
-                Tensor key_flat   = key.view({Config::kv_size, columns});
-                Tensor value_flat = value.view({Config::kv_size, columns});
-                Tensor positions  = f.proposal_positions.slice(1, 0, batch);
-                ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
-                                     layer.query_key_value, query_flat, key_flat, value_flat, s);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, s);
-                Tensor attention = work[r]->alloc(
-                    DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
-                ops::swa(query, key, value, positions,
-                         f.proposal_valid_columns.slice(0, 0, batch),
-                         f.state_destination_slots.slice(0, 0, batch), Config::attention_scale,
-                         draft_state[r]->local_layer(static_cast<std::uint32_t>(layer_index)),
-                         envelopes.local, *work[r], attention, s);
-                // 复制执行 ⇒ 两卡各自算出的 z 逐位相同，卷积+残差 tail 也各自复制（无集合通信）。
-                finish_dynamic_branch(*device[r], *work[r],
-                                      attention.view({Config::query_size, width, batch}),
-                                      layer.attention_output, layer.attention_conv,
-                                      branch.finish_delta, residual[r]);
-            });
+            const auto& layer = weights[0]->layers[layer_index];
+            auto scope  = work[0]->scope();
+            auto branch = workspace_recipe::dflash2_branch<Config>(*work[0], width, batch);
+            prepare_dynamic_branch(state.execution.device, *work[0], residual0, layer.input_norm,
+                                   Config::rms_epsilon, layer.attention_conv, branch);
+            Tensor query =
+                work[0]->alloc(DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
+            Tensor key =
+                work[0]->alloc(DType::BF16, {Config::head_dim, Config::kv_heads, width, batch});
+            Tensor value =
+                work[0]->alloc(DType::BF16, {Config::head_dim, Config::kv_heads, width, batch});
+            Tensor query_flat = query.view({Config::query_size, columns});
+            Tensor key_flat   = key.view({Config::kv_size, columns});
+            Tensor value_flat = value.view({Config::kv_size, columns});
+            ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
+                                 layer.query_key_value, query_flat, key_flat, value_flat,
+                                 device[0]->stream);
+            ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key,
+                              device[0]->stream);
+            Tensor attention =
+                work[0]->alloc(DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
+            ops::swa(query, key, value, positions, valid,
+                     frame.state_destination_slots.slice(0, 0, batch), Config::attention_scale,
+                     dflash_state(state).local_layer(static_cast<std::uint32_t>(layer_index)),
+                     envelopes.local, *work[0], attention, device[0]->stream);
+            finish_dynamic_branch(state.execution.device, *work[0],
+                                  attention.view({Config::query_size, width, batch}),
+                                  layer.attention_output, layer.attention_conv,
+                                  branch.finish_delta, residual0);
         }
-        // ---- MLP 分支：gate_up 列并行（每卡 [17408,5120] shard，gate'|up'），down 行并行 ----
+        // ---- 残差跨卡拷贝：MLP 段两卡从同一份残差出发 ----
+        CUDA_CHECK(cudaEventRecord(tp.events->inputs_ready(0), device[0]->stream));
+        CUDA_CHECK(cudaSetDevice(device[1]->device));
+        CUDA_CHECK(cudaStreamWaitEvent(device[1]->stream, tp.events->inputs_ready(0), 0));
+        CUDA_CHECK(cudaMemcpyAsync(residual1.data, residual0.data, residual0.bytes(),
+                                   cudaMemcpyDeviceToDevice, device[1]->stream));
+        CUDA_CHECK(cudaSetDevice(device[0]->device));
+        // ---- MLP 段：gate_up 列并（每卡 [17408,5120] shard，gate'|up'）+ down 行并 ----
         {
             std::array<Tensor, 2> prepared;
             std::array<Tensor, 2> delta;
             std::array<Tensor, 2> gate_up;
+            std::array<Tensor, 2> residual = {residual0, residual1};
             std::array<WorkspaceArena::Scope, 2> scopes = {work[0]->scope(), work[1]->scope()};
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
                 const auto& layer = weights[r]->layers[layer_index];
                 auto branch = workspace_recipe::dflash2_branch<Config>(*work[r], width, batch);
-                prepare_dynamic_branch(*device[r], *work[r], residual[r],
-                                       layer.post_attention_norm, Config::rms_epsilon,
-                                       layer.mlp_conv, branch);
+                prepare_dynamic_branch(*device[r], *work[r], residual[r], layer.post_attention_norm,
+                                       Config::rms_epsilon, layer.mlp_conv, branch);
                 prepared[r] = branch.prepared;
                 delta[r]    = branch.finish_delta;
                 gate_up[r]  = work[r]->alloc(DType::BF16, {Config::intermediate, columns});
@@ -501,8 +457,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
             constexpr int kShardIntermediate = Config::intermediate / 2;
             for_each_rank(ec, [&](int rank) {
                 const auto r = static_cast<std::size_t>(rank);
-                activation[r] =
-                    work[r]->alloc(DType::BF16, {kShardIntermediate, columns});
+                activation[r] = work[r]->alloc(DType::BF16, {kShardIntermediate, columns});
                 ops::silu_mul(gate_up[r].slice(0, 0, kShardIntermediate),
                               gate_up[r].slice(0, kShardIntermediate, kShardIntermediate),
                               activation[r], device[rank]->stream);
@@ -513,10 +468,12 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                 projected[r] = work[r]->alloc(DType::BF16, {Config::hidden, columns});
                 staging[r]   = work[r]->alloc(DType::BF16, {Config::hidden, columns});
             }
-            ops::linear_row_parallel(
-                activation,
-                {weights[0]->layers[layer_index].down, weights[1]->layers[layer_index].down},
-                projected, staging, ec, *tp.events);
+            ops::linear_row_parallel(activation,
+                                     {weights[0]->layers[layer_index].down,
+                                      weights[1]->layers[layer_index].down},
+                                     projected, staging, ec, *tp.events);
+            // allreduce 之后 projected 两卡逐位相同，卷积+残差 tail 在两卡各自复制执行，
+            // 因此下一层的残差仍然逐位一致。
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
                 const auto& layer = weights[r]->layers[layer_index];
@@ -529,8 +486,8 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     for_each_rank(ec, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         hidden[r]    = work[r]->alloc(DType::BF16, {Config::hidden, mask_columns});
-        ops::rmsnorm_pack_tail(residual[r], weights[r]->final_norm, hidden[r],
-                               device[rank]->stream);
+        ops::rmsnorm_pack_tail(rank == 0 ? residual0 : residual1, weights[r]->final_norm,
+                               hidden[r], device[rank]->stream);
     });
     dflash2_select_candidates<V>(state, frame, hidden[0], &hidden[1], batch, k);
     work[0]->reset();
@@ -778,19 +735,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
 
-        // TP2：草稿在两张卡上各自展开 frame 并前传（见 propose_dflash2_batch_tp2），因此 rank 1
-        // 必须在提案**之前**拿到同一份 ingress —— 两个 frame 的全部输入张量都由它展开。
-        std::optional<TpExecution> tp = tp_execution(state.execution);
-        if (tp) {
-            if (!tp->io->dflash_decode.has_value()) {
-                throw std::logic_error("tensor-parallel DFlash2 decode requires a peer frame");
-            }
-            CUDA_CHECK(cudaSetDevice(tp->device->device));
-            CUDA_CHECK(cudaMemcpyAsync(tp->io->dflash_decode->ingress.data, &state.host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress),
-                                       cudaMemcpyHostToDevice, tp->device->stream));
-            CUDA_CHECK(cudaSetDevice(state.execution.device.device));
-        }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
@@ -831,11 +775,18 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         // ---- DFlash2 tp2：草稿候选由 rank 0 的选择器产出（两卡隐藏态逐位相同，选择器只在
         // rank 0 跑一次），把 draft_tokens 拷给 rank 1，两卡各自验证自己那半 target ----
+        std::optional<TpExecution> tp = tp_execution(state.execution);
         if (tp) {
+            if (!tp->io->dflash_decode.has_value()) {
+                throw std::logic_error("tensor-parallel DFlash2 decode requires a peer frame");
+            }
             qwen3_6::DFlashDecodeState& peer_frame = *tp->io->dflash_decode;
+            // rank 1 用同一份 ingress 记录（DFlash2 的验证默认 greedy，不读 token_counts 指针）
             CUDA_CHECK(cudaSetDevice(tp->device->device));
-            // 草稿是两卡各自那半模型算出来的（TP2）或 rank 0 算出来的（tp1）；两卡位置/嵌入
-            // 相同，所以按构造就是同一批提案
+            CUDA_CHECK(cudaMemcpyAsync(peer_frame.ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress),
+                                       cudaMemcpyHostToDevice, tp->device->stream));
+            // 草稿是 rank 0 那套模型算出来的（两卡位置/嵌入相同），所以按构造就是同一批提案
             CUDA_CHECK(cudaMemcpyAsync(peer_frame.draft_tokens.data, frame.draft_tokens.data,
                                        frame.draft_tokens.bytes(), cudaMemcpyDeviceToDevice,
                                        tp->device->stream));

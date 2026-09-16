@@ -71,9 +71,6 @@ struct TpPeerCore {
     // Present only when the sequence plan enables MTP.
     const qwen3_6::PagedKVCache* mtp_cache  = nullptr;
     const GdnReplayRecords* replay_records  = nullptr;
-    // Rank 1's DFlash2 draft state (TP2 草稿按头分片，每卡自己的半头滑窗 KV)。Absent unless the
-    // sequence plan enables DFlash2; when present it mirrors rank 0's shape exactly.
-    DFlashPersistentState* dflash = nullptr;
     // Rank 1's own pinned MTP ingress record (see PeerRuntime::token_counts). It differs from
     // rank 0's only in the per-row `sampling[row].token_counts` pointer, which must name rank 1's
     // counter lane: `speculative_accept_greedy_drafts` READS and atomically WRITES that pointer
@@ -119,7 +116,6 @@ struct ExecutionCore {
     out.batch_kv       = peer.text_cache;
     out.batch_mtp_kv   = peer.mtp_cache;
     out.replay_records = peer.replay_records;
-    out.dflash         = peer.dflash;
     return out;
 }
 
