@@ -321,6 +321,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, proposal_extents), DType::I32, {batch});
     target_valid_columns =
         ingress_tensor(offsetof(DFlashDecodeIngress, target_valid_columns), DType::I32, {batch});
+    // 上游 master 的 DFlash 状态没绑定这个字段（其 draft 走另一个入口），
+    // 本 fork 的 DFlash2 提案路径要用它，必须绑上，否则是野张量。
+    proposal_valid_columns =
+        ingress_tensor(offsetof(DFlashDecodeIngress, proposal_valid_columns), DType::I32, {batch});
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
