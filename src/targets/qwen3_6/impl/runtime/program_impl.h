@@ -2339,6 +2339,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (is_masked_draft_backend(speculative_backend) &&
                 (!dflash || !sequence.kv || !sequence.kv->backend ||
                  sequence.dflash_context_frontier < frontier)) {
+                std::fprintf(stderr, "[dbg] rwckpt: dflash=%d kv=%d backend=%d fr=%u/%u\n",
+                             dflash ? 1 : 0, sequence.kv ? 1 : 0,
+                             (sequence.kv && sequence.kv->backend) ? 1 : 0,
+                             sequence.dflash_context_frontier, frontier);
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
             sequence.rewrite_checkpoint = RewriteCheckpoint{
