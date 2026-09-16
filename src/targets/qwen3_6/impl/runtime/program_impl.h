@@ -2805,6 +2805,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                          dflash_host_egress->licensed_counts[0]);
         }
 
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
