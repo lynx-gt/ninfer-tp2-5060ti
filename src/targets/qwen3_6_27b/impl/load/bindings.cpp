@@ -619,21 +619,16 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return {};
     }
 
-    // DFlash2 草稿的 TP2 分片：**只切四个大 GEMM**，qkv 投影与滑窗 attention 保持在两卡上复制
-    // 运行。这是草稿 attention 的编译期几何决定的：swa 的 bidirectional GQA kernel 把
-    // 32 query 头 / 8 kv 头写死（src/ops/kernel/bidirectional_gqa_attention.cuh），而草稿权重
-    // 流量被 gate_up(189MB)+down(95MB) 两件主导 —— 切它们已经拿到 340→187MB/卡的收益，
-    // qkv(33MB) 留下的增量只有约 17MB/卡，不值得为它改 kernel 或动 KV 布局。
-    // 复制的 attention 在两卡上逐位相同（同一权重、同一 KV、确定性 kernel），因此行并的
-    // attention/output 两卡取到的是同一份张量的各自半段，收缩维切分成立。
+    // DFlash2 草稿的 TP2 分片：**只切 MLP 两件大 GEMM**（gate_up 列并、down 行并），
+    // qkv / 滑窗 attention / attention/output 全部在两卡上复制运行。理由有三：
+    //   ① 草稿权重流量被 gate_up(189MB)+down(95MB) 主导，切它们已把每卡 340MB 压到 198MB；
+    //   ② swa 的 bidirectional GQA kernel 把 32 query 头 / 8 kv 头写死；
+    //   ③ attention 输出是**复制**的（非分片），而本引擎的张量 dim-0 最快，[4096,T] 的
+    //      "第 r 个 2048 行块"不是连续段，行并行投影会拒绝；列并行 + allgather 又要多一次
+    //      跨卡集合通信。22MB 的收益换不来这些改动，故 out 保持复制。
     // check_nvfp4_tile_alignment=false：dflash2 的对象全部是 W8G32_F16S（row-split-k128-v1）
     // 或 BF16，永远不会是 blockscale-k16-m128x4-v1。
     if (object.starts_with("dflash2/")) {
-        if (ends("attention/output")) {
-            append_row_parallel(plan, DFlashConfig::query_size, tp, DFlashConfig::query_heads,
-                                object);
-            return by_columns(std::move(plan));
-        }
         if (ends("mlp/gate_up")) {
             constexpr std::uint64_t half = DFlashConfig::intermediate;
             append_column_block(plan, 0, half, tp, half, object, false);
@@ -1202,7 +1197,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                                  NumericFormat::BF16, {128}, device);
             target.attention_output =
                 materialized_weight(backing, layer_source.attention_output, 5120,
-                                    DFlashConfig::query_size / tp, device);
+                                    DFlashConfig::query_size, device);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, layer_source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.mlp_conv.base_kernel = artifact::materialized_tensor(

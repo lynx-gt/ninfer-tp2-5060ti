@@ -188,18 +188,16 @@ int main() {
         expect_plan(plan_for("mtp/layer/mlp/down", 2, config), expected, "mtp mlp down");
     }
 
-    // --- DFlash2 草稿层（本 fork 的 TP2 分片）：只切四个大 GEMM 中的三个 —— attention/output
-    // 行并行、gate_up 两段列切、mlp/down 行并行；qkv 投影与滑窗 attention 保持复制（swa 的
-    // bidirectional GQA kernel 把 32Q/8KV 头写死，且 qkv 只占草稿权重流量的 10%）。
+    // --- DFlash2 草稿层（本 fork 的 TP2 分片）：只切 MLP 两件大 GEMM —— gate_up 两段列切、
+    // mlp/down 行并行；qkv / 滑窗 attention / attention/output 保持复制。
     //
-    // attention/output 的收缩维是 4096（草稿的 query_size），**不是**文本层的 6144：
-    // 通用 `ends("attention/output")` 规则在这里会给出错误的 3072/卡，本用例把 dflash2 自己的
-    // 2048/卡 钉死。 ---
-    {
-        const ShardPlan expected = {Shard{0, 0, 2048}, Shard{1, 2048, 2048}};
-        expect_plan(plan_for("dflash2/layers/0/attention/output", 2, config), expected,
-                   "dflash2 o_proj");
-    }
+    // 为什么只切 MLP：草稿权重流量被 gate_up(189MB)+down(95MB) 主导（340MB 里的 84%），切成
+    // 每卡 198MB；attention/output 只有 22MB，而 attention 输出是复制张量、本引擎 dim-0 最快
+    // 的布局下它的"第 r 个 2048 行块"不是连续段（行并行投影会拒绝），列并行 + allgather 又要
+    // 多一次集合通信 —— 不值得。swa 的 bidirectional GQA kernel 也把 32Q/8KV 头写死。
+    //
+    // 本用例把 dflash2 与文本层的形状差异钉死：dflash2 的 intermediate 是 17408（与文本层
+    // 巧合相同），但它没有 attention/output 的行并、也没有 qkv 的列并。 ---
     {
         const ShardPlan expected = concat(half_block(0, 17408), half_block(17408, 17408));
         expect_plan(plan_for("dflash2/layers/0/mlp/gate_up", 2, config), expected,
@@ -208,9 +206,10 @@ int main() {
                    ShardPlan{Shard{0, 0, 8704}, Shard{1, 8704, 8704}}, "dflash2 down");
     }
     for (std::string_view object :
-         {"dflash2/layers/0/attention/query_key_value", "dflash2/layers/0/input_norm",
-          "dflash2/layers/0/post_attention_norm", "dflash2/layers/0/attention/query_norm",
-          "dflash2/layers/0/attention/key_norm", "dflash2/layers/0/attention_conv/base_kernel",
+         {"dflash2/layers/0/attention/query_key_value", "dflash2/layers/0/attention/output",
+          "dflash2/layers/0/input_norm", "dflash2/layers/0/post_attention_norm",
+          "dflash2/layers/0/attention/query_norm", "dflash2/layers/0/attention/key_norm",
+          "dflash2/layers/0/attention_conv/base_kernel",
           "dflash2/layers/0/attention_conv/kernel_projection",
           "dflash2/layers/0/mlp_conv/base_kernel",
           "dflash2/layers/0/mlp_conv/kernel_projection", "dflash2/feature_projection",

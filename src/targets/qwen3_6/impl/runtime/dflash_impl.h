@@ -409,10 +409,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     const int width        = k + 1;
     const int columns      = width * batch;
     const int mask_columns = k * batch;
-    // attention/output 的行并行收缩维是草稿的 query_size(4096)，每卡一半。
-    constexpr int kQRows = Config::query_size / 2;  // 2048
-    static_assert(Config::query_size % 2 == 0 && Config::intermediate % 2 == 0,
-                  "DFlash2 TP2 需要偶数收缩维");
+    static_assert(Config::intermediate % 2 == 0, "DFlash2 TP2 需要偶数 intermediate");
 
     // ---- 每卡自己的 frame 展开 + 嵌入（同一份 ingress 各卡独立展开，结果逐位相同）----
     std::array<Tensor, 2> residual;
@@ -436,13 +433,9 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
     for (std::size_t layer_index = 0; layer_index < Config::layers; ++layer_index) {
         nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
                                       layer_index);
-        // ---- attention 分支：qkv 与滑窗 attention 在两卡上**复制**运行（swa 的 kernel 把
-        // 32Q/8KV 头写死），只有 attention/output 的行并行投影分片。复制的 attention 两卡逐位
-        // 相同，行并的两半因此取自同一份张量。 ----
+        // ---- attention 分支：qkv / 滑窗 attention / attention/output 全部**复制**运行，
+        // 与单卡路径逐行同构（两卡各自算同一份结果）。只有 MLP 分支分片。 ----
         {
-            std::array<Tensor, 2> prepared;
-            std::array<Tensor, 2> delta;
-            std::array<Tensor, 2> attention;
             std::array<WorkspaceArena::Scope, 2> scopes = {work[0]->scope(), work[1]->scope()};
             for_each_rank(ec, [&](int rank) {
                 const auto r      = static_cast<std::size_t>(rank);
@@ -452,8 +445,6 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                 auto branch = workspace_recipe::dflash2_branch<Config>(*work[r], width, batch);
                 prepare_dynamic_branch(*device[r], *work[r], residual[r], layer.input_norm,
                                        Config::rms_epsilon, layer.attention_conv, branch);
-                prepared[r] = branch.prepared;
-                delta[r]    = branch.finish_delta;
                 Tensor query = work[r]->alloc(
                     DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
                 Tensor key = work[r]->alloc(
@@ -467,34 +458,18 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                 ops::attn_input_proj(branch.prepared.view({Config::hidden, columns}),
                                      layer.query_key_value, query_flat, key_flat, value_flat, s);
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, s);
-                attention[r] = work[r]->alloc(
+                Tensor attention = work[r]->alloc(
                     DType::BF16, {Config::head_dim, Config::query_heads, width, batch});
                 ops::swa(query, key, value, positions,
                          f.proposal_valid_columns.slice(0, 0, batch),
                          f.state_destination_slots.slice(0, 0, batch), Config::attention_scale,
                          draft_state[r]->local_layer(static_cast<std::uint32_t>(layer_index)),
-                         envelopes.local, *work[r], attention[r], s);
-            });
-            std::array<Tensor, 2> projected;
-            std::array<Tensor, 2> staging;
-            for (std::size_t r = 0; r < 2; ++r) {
-                projected[r] = work[r]->alloc(DType::BF16, {Config::hidden, columns});
-                staging[r]   = work[r]->alloc(DType::BF16, {Config::hidden, columns});
-            }
-            // 行并行：rank r 取 attention 输出（两卡逐位相同，含全部 32 头）的第 r 个 2048 行块，
-            // 各自算 [5120,2048] 权重 shard 的部分积，一次 allreduce 得到完整投影。
-            Tensor context0 = attention[0].view({Config::query_size, columns});
-            Tensor context1 = attention[1].view({Config::query_size, columns});
-            ops::linear_row_parallel({context0.slice(0, 0, kQRows),
-                                      context1.slice(0, kQRows, kQRows)},
-                                     {weights[0]->layers[layer_index].attention_output,
-                                      weights[1]->layers[layer_index].attention_output},
-                                     projected, staging, ec, *tp.events);
-            for_each_rank(ec, [&](int rank) {
-                const auto r      = static_cast<std::size_t>(rank);
-                const auto& layer = weights[r]->layers[layer_index];
-                ops::dynamic_grouped_conv_add_tail(projected[r], layer.attention_conv.base_kernel,
-                                                   delta[r], residual[r], device[rank]->stream);
+                         envelopes.local, *work[r], attention, s);
+                // 复制执行 ⇒ 两卡各自算出的 z 逐位相同，卷积+残差 tail 也各自复制（无集合通信）。
+                finish_dynamic_branch(*device[r], *work[r],
+                                      attention.view({Config::query_size, width, batch}),
+                                      layer.attention_output, layer.attention_conv,
+                                      branch.finish_delta, residual[r]);
             });
         }
         // ---- MLP 分支：gate_up 列并行（每卡 [17408,5120] shard，gate'|up'），down 行并行 ----

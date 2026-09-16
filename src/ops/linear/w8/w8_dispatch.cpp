@@ -44,8 +44,7 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                             n == 7168 ||     // 14336  / 2 (attention input)
                                             n == 17408 ||    // 34816  / 2 (mlp/gate_up)
                                             n == 124160);    // 248320 / 2 (output_head)
-    const bool row_shard    = n == 5120 && (k == 2048 ||     // 4096   / 2 (dflash2 attention/output)
-                                            k == 3072 ||     // 6144   / 2 (attention/gdn output)
+    const bool row_shard    = n == 5120 && (k == 3072 ||     // 6144   / 2 (attention/gdn output)
                                             k == 5120 ||     // 10240  / 2 (mtp/input_projection)
                                             k == 8704);      // 17408  / 2 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
