@@ -2801,6 +2801,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
             std::array<std::int32_t, 16> dbg_pids{};
             std::array<std::int32_t, 16> dbg_ppos{};
+            std::array<float, 128> dbg_q{};
+            if (io.dflash_decode->proposal_q.data != nullptr) {
+                CUDA_CHECK(cudaMemcpy(dbg_q.data(), io.dflash_decode->proposal_q.data,
+                                      16 * draft_window * static_cast<std::size_t>(sizeof(float)),
+                                      cudaMemcpyDeviceToHost));
+            }
             // 完整候选矩阵：candidate_ids 是 [16,K,B]，row-major ⇒ cand[c*K + i]（B=1）。
             std::array<std::int32_t, 128> dbg_all{};
             if (io.dflash_decode->candidate_ids.data != nullptr) {
@@ -2819,8 +2825,29 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 for (int c = 0; c < 16; ++c) {
                     if (dbg_all[c * draft_window + i] == dbg_argmax[i]) { present = true; }
                 }
-                std::fprintf(stderr, "  | target=%d in_set=%d draft=%d\n", dbg_argmax[i],
-                             present ? 1 : 0, dbg_drafts[i]);
+                // 选出来的 draft 是否在该列的候选集里（选择的合法性自检）
+                bool picked_in_set = false;
+                int picked_rank    = -1;
+                for (int c = 0; c < 16; ++c) {
+                    if (dbg_all[c * draft_window + i] == dbg_drafts[i]) {
+                        picked_in_set = true;
+                        picked_rank   = c;
+                    }
+                }
+                // proposal_q 的 argmax 应该就是 draft[i]
+                int q_argmax = -1;
+                if (io.dflash_decode->proposal_q.data != nullptr) {
+                    float best = -1.0f;
+                    for (int c = 0; c < 16; ++c) {
+                        const float q = dbg_q[c * draft_window + i];
+                        if (q > best) { best = q; q_argmax = c; }
+                    }
+                }
+                std::fprintf(stderr,
+                             "  | target=%d in_set=%d draft=%d picked_in_set=%d picked_rank=%d "
+                             "q_argmax=%d\n",
+                             dbg_argmax[i], present ? 1 : 0, dbg_drafts[i], picked_in_set ? 1 : 0,
+                             picked_rank, q_argmax);
             }
             CUDA_CHECK(cudaMemcpy(dbg_pids.data(), io.dflash_decode->proposal_ids.data,
                                   8 * static_cast<std::size_t>(sizeof(std::int32_t)),
