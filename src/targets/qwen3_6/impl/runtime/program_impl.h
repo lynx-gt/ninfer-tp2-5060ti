@@ -2773,6 +2773,17 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       draft_window, envelopes, target_envelope, executable);
         device.synchronize();
 
+        // [dbg] 临时：按轮打印本轮的接受草稿数（teacher-forced 对照用）。
+        {
+            static int dbg_round = 0;
+            if (dbg_round < 8) {
+                ++dbg_round;
+                std::fprintf(stderr, "[dbg] round %d accepted=%d licensed=%d\n", dbg_round,
+                             dflash_host_egress->accepted_drafts[0],
+                             dflash_host_egress->licensed_counts[0]);
+            }
+        }
+
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
