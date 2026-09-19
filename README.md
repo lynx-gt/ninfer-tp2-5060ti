@@ -4,7 +4,7 @@
 
 > Tensor-parallel NInfer on two consumer cards. Qualified on **2× RTX 5060 Ti (16 GiB each)**: one
 > 27B model resident across both GPUs, a **253,952-token single-slot context**, five KV-cache tiers
-> (`bf16` / `int8` / `fp8` / `k16v8` / `k16i8`), MTP3 speculative decoding with prefix reuse that actually
+> (`bf16` / `int8` / `k16i8`), MTP3 speculative decoding with prefix reuse that actually
 > hits, and a `/health` that reports engine availability.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints. It runs
@@ -19,7 +19,7 @@ measures is in the fork note.
 > [giocom/ninfer-3060X2](https://github.com/giocom/ninfer-3060X2)) and, on that base, adds **dual-GPU
 > tensor parallelism** (`--tp 2 --devices A,B`) to the 27B execution package: one resident model, one
 > process, two devices, no NVLink and no distributed serving, halving per-card weight and KV residency.
-> This fork further adds **KV-cache tiers** (`--kv-dtype bf16|int8|fp8|k16v8|k16i8`), a **working MTP prefix
+> This fork further adds **KV-cache tiers** (`--kv-dtype bf16|int8|k16i8`), a **working MTP prefix
 > reuse at `--tp 2`**, and a **truthful `/health`** with supervisor-driven self-heal; those three were
 > measured on **2× RTX 5060 Ti (16 GiB each)**. `--tp 1` output is byte-identical to `feaf4dd` on the
 > greedy cases in [`tests/data/tp1-golden/`](tests/data/tp1-golden/MANIFEST.md), and single-GPU
@@ -162,7 +162,7 @@ official artifact instead, swap the path — with `int8` KV it fits a full 262,1
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4w4a4.ninfer \
   --host 0.0.0.0 --port 8815 --model-id qwen3.8-27b-w4a4-mtp3 \
-  --tp 2 --devices 0,1 --kv-dtype k16v8 \
+  --tp 2 --devices 0,1 --kv-dtype k16i8 \
   --max-context 253952 --kv-capacity 253952 --prefill-chunk 1024 \
   --spec mtp --draft-tokens 3 --lm-head-draft --max-concurrency 1 --cors
 ```
@@ -305,7 +305,7 @@ W4A4 artifact described under [The weights](#the-weights).
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4w4a4.ninfer \
   --tp 2 --devices 0,1 \
   --max-context 253952 --kv-capacity 253952 --prefill-chunk 1024 \
-  --kv-dtype k16v8 \
+  --kv-dtype k16i8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --max-concurrency 1
 ```
@@ -317,7 +317,7 @@ entirely inside the reasoning stream:
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4w4a4.ninfer \
   --tp 2 --devices 0,1 \
-  --max-context 253952 --kv-capacity 253952 --kv-dtype k16v8 \
+  --max-context 253952 --kv-capacity 253952 --kv-dtype k16i8 \
   --messages long_prompt.json --max-new 256 --no-thinking
 ```
 
@@ -331,7 +331,7 @@ entirely inside the reasoning stream:
 - `--kv-capacity` must be at least `--max-context`. The explicit form is what fits a tier at its
   ceiling; `auto` also keeps a 512 MiB sizing headroom.
 - `--max-concurrency 1` is arithmetic on 16 GiB cards: the tier table below is what one slot costs,
-  and `k16v8` at 253,952 leaves no room for a second.
+  and `k16i8` at 253,952 leaves no room for a second.
 - MTP speculative decoding (`--spec mtp --draft-tokens 1..5`, optionally `--lm-head-draft`) works at
   `--tp 2`, including compatible-prefix reuse. `--spec dflash` and `--vision` are rejected at
   `--tp 2`.
@@ -344,35 +344,33 @@ See the [CLI guide](docs/cli.md) and [HTTP serving](docs/serving.md) for the ful
 ### KV-cache tiers and long-context limits
 
 `--kv-dtype` selects the KV codec per side: `bf16` (no quantization), `int8` (per-64 fp16 scale),
-`fp8` (e4m3, per-256 fp16 scale), `k16v8` (BF16 keys + FP8 values). All tiers compute QK in BF16;
-the codec only changes residency and read-back.
+`k16i8` (BF16 keys + INT8 values, V scaled every 64 dims). All tiers compute QK in BF16; the codec
+only changes residency and read-back. The earlier FP8 KV tiers (`fp8` = e4m3 both sides, `k16v8` =
+BF16 keys + e4m3 values) were removed after measurement: at the same cost per token the INT8 V codec
+accepts at least as well and no longer needs the kernel to expand e4m3 codes into BF16 in shared
+memory (which measured slower, not faster: 131k-token decode 21.0 tok/s for `fp8` vs 25.6 for `k16i8`
+and 36.5 for `int8`).
 
-Measured on 2× RTX 5060 Ti (TP2, one slot, 8k-token prompt, `--spec mtp --draft-tokens 3
---lm-head-draft --prefill-chunk 1024`):
+Measured on 2× RTX 5060 Ti (TP2, one slot, `--prefill-chunk 1024`, MTP3 + `--lm-head-draft`,
+greedy; acceptance on three prompts — science / horror prose / JSON):
 
-| `--kv-dtype` | prefill | decode | MTP acceptance | 1-slot context ceiling |
-|---|---|---|---|---|
-| `int8` | 4880 tok/s | 106.5 tok/s | 3.04 tok/round | 262144 |
-| `fp8` | 4170 tok/s | 91.4 tok/s | 2.69 tok/round | 262144 |
-| `k16v8` | 4480 tok/s | 88.2 tok/s | 2.56 tok/round | 253952 (chunk 1024) / 229376 (chunk 4096) |
-| `bf16` | — | — | 2.89 tok/round | — |
+| `--kv-dtype` | 21k prefill | 131k prefill | 131k decode | MTP acceptance (P1/P2/P3) | 1-slot ceiling |
+|---|---|---|---|---|---|
+| `int8` | 4376 tok/s | 1991 tok/s | 36.5 tok/s | 2.18 / 1.96 / 4.00 | 262144 |
+| `k16i8` | 3946 tok/s | 1489 tok/s | 25.6 tok/s | **2.46 / 1.97 / 4.00** | 253952 (chunk 1024) / 229376 (chunk 4096) |
+| `bf16` | ~3990 tok/s | ~1520 tok/s | 26.5 tok/s | 2.43 / 1.92 / 4.00 | — |
 
-`k16i8` (BF16 keys + INT8 values) is available too. It was added on the theory that INT8's uniform V
-quantization would accept better than E4M3's four-bit mantissa. Measured over five prompts (science,
-horror prose, reasoning, JSON output, prose continuation; greedy, 250 tokens each) it reaches an
-acceptance length of **2.562 tok/round against k16v8's 2.488**, and 92.6 against 89.6 tok/s decode —
-a small but consistent edge (higher on four of five, largest on prose continuation +0.19 and
-structured output +0.08). It costs about 10 MiB more KV per slot at 65536 tokens, because INT8 scales
-every 64 dimensions against FP8's every 256.
+`int8` is the fastest everywhere; `k16i8` trades ~10% of that for BF16 keys (it also runs the
+`int8`-side V dequant with a 64-dim scale). Both beat the removed e4m3 V tier on acceptance, which is
+what the per-round cost turns into tokens: per-round cost is nearly the same across tiers
+(28.5–29.4 ms), so the token-rate spread follows the acceptance length. `--kv-capacity` must be
+≥ `--max-context`, and the explicit-capacity form is what fits a tier at its ceiling (`auto` keeps a
+512 MiB sizing headroom, which `k16i8` cannot afford at 253952).
 
-Per-round cost is the same across tiers (28.5–29.4 ms); the token-rate spread comes from the
-acceptance length the speculative pairing reaches. `--kv-capacity` must be ≥ `--max-context`, and
-the explicit-capacity form is what fits a tier at its ceiling (`auto` keeps a 512 MiB sizing
-headroom, which `k16v8` cannot afford at 253952).
+Long context (`k16i8`, 1 slot, 253952): decode stays flat in the prefill-free regime and degrades
+with context only through the KV read (at 131k tokens the KV stream is ~5.7 GB per round against
+10.36 GiB of weights per card), which is why the tiers separate at long context.
 
-Long context (k16v8, 1 slot, 253952): a 57.7k-token prompt prefills in 30.4 s (1905 tok/s), a
-192.6k-token prompt in 287 s (672 tok/s) with a correct mid-context needle and constant 15.7 GiB
-per GPU — prefill is O(T²) and gets slow, decode is unaffected (82–96 tok/s).
 
 Prefix reuse hits when the retained turn checkpoint covers the prompt: a repeated request reports
 `cache=7872 reuse=restore_turn_checkpoint` and its time-to-first-token drops from 1788 ms to 71 ms.
@@ -416,10 +414,6 @@ carry `usage.cache_read_input_tokens` (with `cache_creation_input_tokens` report
   suffix from the retained checkpoint frontier instead of from the full-prefill chunk grid, so the
   two runs are not bit-identical and greedy text can occasionally flip. This is the same class of
   caveat as vLLM/SGLang prefix caching, and it is why a cache hit is not a correctness contract.
-- **The FP8 tiers prefill about 9–14% slower than `int8`.** The FP8 KV staging path is not yet
-  asynchronous; decode is unaffected.
-- **`k16v8` cannot reach 262144 tokens in a single slot.** Its BF16 keys cost 26.2 KiB/token, so the
-  one-slot ceiling is 253952 with `--prefill-chunk 1024` (and 229376 with `--prefill-chunk 4096`).
 
 The design decisions behind the TP2 path -- the collective transport, the shard map, and what each
 correctness gate actually proves -- are in
@@ -436,7 +430,7 @@ support:
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- KV cache tiers `bf16`, `int8` (group-64), `fp8` (e4m3) and `k16v8` (BF16 keys + FP8 values);
+- KV cache tiers `bf16`, `int8` (group-64) and `k16i8` (BF16 keys + INT8 values);
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
 - compatible-prefix reuse, including MTP at `--tp 2`, with the hit count reported as
@@ -488,12 +482,12 @@ branch as ahead of *and* behind `Neroued:master` -- that is the state of this li
 
 | | this fork | upstream `master` |
 |---|---|---|
-| `--kv-dtype` | `bf16`, `int8`, `fp8`, **`k16v8`** (BF16 keys + FP8 values) | `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4` |
+| `--kv-dtype` | `bf16`, `int8`, **`k16i8`** (BF16 keys + INT8 values) | `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4` |
 | Tensor parallelism | `--tp 2 --devices A,B`, validated on 2× RTX 5060 Ti | single GPU |
 | `/health` | engine availability, plus a supervisor-driven restart when the engine dies | engine availability |
 
 If you want `nvfp4` / `k8v4` KV tiers or upstream's newest single-GPU scheduling work, use upstream.
-If you want tensor-parallel serving on two consumer cards with the `k16v8` tier and MTP prefix reuse
+If you want tensor-parallel serving on two consumer cards with the `k16i8` tier and MTP prefix reuse
 that actually hits, this fork is the line to use.
 
 ## Getting help
