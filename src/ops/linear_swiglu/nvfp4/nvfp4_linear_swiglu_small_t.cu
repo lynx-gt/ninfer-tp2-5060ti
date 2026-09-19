@@ -79,9 +79,10 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
     static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
+    static constexpr int kPhaseUnroll   = ActiveTokens >= 5 ? 2 : 1;
     using Schedule = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
-                                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                         Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+                                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
+                                         kPhaseUnroll, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;

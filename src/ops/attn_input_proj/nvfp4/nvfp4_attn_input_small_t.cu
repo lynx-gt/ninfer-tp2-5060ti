@@ -58,10 +58,12 @@ struct Nvfp4AttentionSmallTProductionSchedule {
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kRowsPerWarp   = ActiveTokens >= 5 ? 4 : 2;
+    static constexpr int kPhaseUnroll   = ActiveTokens >= 5 ? 2 : 1;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
+                            kActivationAccess, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
+                            kPhaseUnroll, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 template <class Geometry, int ActiveTokens>

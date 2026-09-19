@@ -272,10 +272,12 @@ struct Nvfp4LinearSmallTProductionSchedule {
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kRowsPerWarp   = ActiveTokens >= 5 ? 4 : 2;
+    static constexpr int kPhaseUnroll   = ActiveTokens >= 5 ? 2 : 1;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
+                            kActivationAccess, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
+                            kPhaseUnroll, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 // G1's wider N benefits from keeping four warps per CTA throughout the A16 policy boundary. Only
@@ -289,10 +291,12 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> 
     static constexpr auto kActivationAccess = ActiveTokens == 2
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kRowsPerWarp   = ActiveTokens >= 5 ? 4 : 2;
+    static constexpr int kPhaseUnroll   = ActiveTokens >= 5 ? 2 : 1;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
+                            kActivationAccess, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
+                            kPhaseUnroll, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 // At N=5120, R1 needs the larger CTA only for the last three A16 token counts. The unoptimized
@@ -304,10 +308,12 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveToke
     static constexpr int kWarpsPerCta   = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
     static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kRowsPerWarp   = ActiveTokens >= 5 ? 4 : 2;
+    static constexpr int kPhaseUnroll   = ActiveTokens >= 5 ? 2 : 1;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
+                            kActivationAccess, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
+                            kPhaseUnroll, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 // R2's longer K moves the stable four-to-sixteen-warp crossover to T=8.
@@ -318,10 +324,12 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
     static constexpr int kWarpsPerCta       = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
     static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kRowsPerWarp   = ActiveTokens >= 5 ? 4 : 2;
+    static constexpr int kPhaseUnroll   = ActiveTokens >= 5 ? 2 : 1;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
+                            kActivationAccess, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
+                            kPhaseUnroll, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 // A tp2 shard inherits its parent's measured schedule. Attention-input and MLP gate-up shards need
