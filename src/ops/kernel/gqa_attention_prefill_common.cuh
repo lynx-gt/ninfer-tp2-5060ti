@@ -19,9 +19,32 @@ namespace ninfer::ops {
 inline constexpr int kGqaPrefillHeadDim = 256;
 
 inline constexpr int kGqaPrefillBr        = 64;
-inline constexpr int kGqaPrefillBc        = 64;
-inline constexpr int kGqaPrefillThreads   = 128;
-inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) *
+// GQA-aware：一个 CTA 负责同一 kv_head 组内的 kGqaPrefillHeadsPerCta 个 q_head，
+// 共享同一趟 K/V 载入 ⇒ 每卡 KV 读遍数从 (token/Br)×heads 降到 (token/Br)×(heads/G)。
+// 寄存器预算不变（每个 warp 仍只持有自己那个 q_head 的 acc），代价是 smem 从
+// (Br+2Bc) 变成 (G·Br+2Bc) 行。
+//
+// ⚠️ 实测结论（2026-09-19）：**保持 1，不要开**。G=2 在
+//   ① 138k 冷 prefill：1397.63 → 1408.83 tok/s（+0.8%）
+//   ② 108k 前缀 + 7.8k 增量：8.82 → 8.75 s（+0.8%）
+// 两项都等于噪声。原因是 prefill/增量的注意力**贴在 bf16 MMA 屋顶**：
+//   冷 138k = 4.4e10 (行×key) 访问/s，增量 = 4.3e10/s（同一个数）⇒ 每次访问的成本固定，
+//   折算 44 TFLOPS/卡；同批测试里 NVFP4 linear 跑到 130 TFLOPS/卡 ⇒ 本卡 bf16 ≈ 1/4 之，
+//   即注意力已用掉 ~100% 的 bf16 tensor-core 吞吐。砍 KV 字节（G 提高）不影响"访问次数"，
+//   所以数学上就不该有效。真正的杠杆只有两条：换更快的 QK MMA 格式（int8 现成，−25%；
+//   或 e4m3-K 直通 fp8 MMA）或减少 FLOPs（算法近似，质量换速度）。
+//   细节：docs/ninfer_性能测试口径.md §5.3。
+inline constexpr int kGqaPrefillHeadsPerCta = 1;
+// Bc=16 keeps the prompt smem budget at (64 + 2·16)·256·2 = 48 KiB, which is what lets this
+// kernel reach the 2 CTAs/SM that its 240 registers/thread allow on a 100 KiB/SM part
+// (RTX 5060 Ti). At Bc=64 the budget is 96 KiB and only one CTA fits: the kernel is
+// latency-bound, which measured 11% slower on a cold 21k prompt and 44-62% slower on
+// long-context incremental prompts. Bc must divide the paged-KV page size (64).
+inline constexpr int kGqaPrefillBc        = 16;
+inline constexpr int kGqaPrefillWarpsPerHead =
+    4; // 每个 head 4 个 warp（每 warp 16 行，刚好 64 行）
+inline constexpr int kGqaPrefillThreads      = 32 * kGqaPrefillWarpsPerHead * kGqaPrefillHeadsPerCta;
+inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillHeadsPerCta * kGqaPrefillBr + 2 * kGqaPrefillBc) *
                                             kGqaPrefillHeadDim *
                                             static_cast<int>(sizeof(__nv_bfloat16));
 

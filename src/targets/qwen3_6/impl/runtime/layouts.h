@@ -66,7 +66,7 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    // K/V 两侧的 codec 各自独立（k16v8 = K bf16 无 scale + V e4m3 每 256 维 1 个 scale；
+    // K/V 两侧的 codec 各自独立（k16i8 = K bf16 无 scale + V int8 每 64 维 1 个 scale；
     // int8 是每 64 组）。quant_group == 0 表示该侧无 scale。路由选核以 K 侧为主，
     // V 侧决定的是 V 的暂存/反量化路径。
     DType kv_k_dtype                       = DType::BF16;
@@ -107,7 +107,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    // K/V 两侧的 codec 各自独立（k16v8 = K bf16 无 scale + V e4m3 每 256 维 1 个 scale；
+    // K/V 两侧的 codec 各自独立（k16i8 = K bf16 无 scale + V int8 每 64 维 1 个 scale；
     // int8 是每 64 组）。quant_group == 0 表示该侧无 scale。路由选核以 K 侧为主，
     // V 侧决定的是 V 的暂存/反量化路径。
     DType kv_k_dtype                       = DType::BF16;

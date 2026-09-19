@@ -736,19 +736,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // attention workspace 的档位参数（gqa_attention_workspace_capacity_bytes）只取决于 K 侧：
     // 它唯一的 dtype 消费者是 gqa_attention_split_capacity（QK 的 MMA 路径），V 侧的 staging 在
     // 内核自己的 smem 里，不参与 workspace 尺寸。所以允许「两侧同档」与「K=bf16 无 scale 配
-    // V 的任一 8 位档」（k16v8 = V e4m3 每 256 维 1 个 scale；k16i8 = V i8 每 64 维 1 个 scale），
-    // 其余组合显式拒绝。
+    // V=int8（每 64 维 1 个 scale，即 k16i8 档）」，其余组合显式拒绝。
     const bool same_side = inputs.kv_k_dtype == inputs.kv_v_dtype &&
                            inputs.kv_k_quant_group == inputs.kv_v_quant_group;
     const bool k16_8bit_v = inputs.kv_k_dtype == DType::BF16 && inputs.kv_k_quant_group == 0 &&
-                            ((inputs.kv_v_dtype == DType::FP8_E4M3FN &&
-                              inputs.kv_v_quant_group == qwen3_6::kKvFp8ScaleGroup) ||
-                             (inputs.kv_v_dtype == DType::I8 &&
-                              inputs.kv_v_quant_group == qwen3_6::kKvQuantGroup));
+                            inputs.kv_v_dtype == DType::I8 &&
+                            inputs.kv_v_quant_group == qwen3_6::kKvQuantGroup;
     if (!same_side && !k16_8bit_v) {
         throw std::invalid_argument(
             "unsupported per-side KV codec combination（目前只接通「两侧同档」与 "
-            "K=bf16 无 scale + V 的 e4m3/i8 两档）");
+            "K=bf16 无 scale + V=i8 的 k16i8 档）");
     }
     impl->kv_dtype            = inputs.kv_k_dtype;
     impl->kv_quant_group      = inputs.kv_k_quant_group;
@@ -837,7 +834,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 //   bf16  : K/V 都 bf16、无 scale
 //   int8  : K/V 都 I8 + 每 64 组 1 个 fp16 scale
 //   fp8   : K/V 都 FP8_E4M3FN + 每 256 维 1 个 fp16 scale
-//   k16v8 : K bf16 无 scale、V FP8_E4M3FN（每 256 维 1 个 scale）
+//   k16i8 : K bf16 无 scale、V I8（每 64 维 1 个 scale）
 //   k16i8 : K bf16 无 scale、V I8（每 64 维 1 个 scale）
 // 注意：这里只负责"建池/建视图"；**是否真的能用**由内核路由决定（gqa_attention.cpp 会在
 // V 侧 codec 尚未接通时显式拒绝，避免拿 bf16 内核去读 fp8 的 V 而静默出错）。
@@ -845,8 +842,6 @@ DType kv_cache_k_dtype(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return DType::BF16;
     case KvCacheStorage::Int8Group64: return DType::I8;
-    case KvCacheStorage::Fp8E4M3Row256: return DType::FP8_E4M3FN;
-    case KvCacheStorage::Bf16KeyFp8Value: return DType::BF16;
     case KvCacheStorage::Bf16KeyInt8Value: return DType::BF16;
     }
     throw std::invalid_argument("unknown kv cache storage");
@@ -856,8 +851,6 @@ DType kv_cache_v_dtype(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return DType::BF16;
     case KvCacheStorage::Int8Group64: return DType::I8;
-    case KvCacheStorage::Fp8E4M3Row256: return DType::FP8_E4M3FN;
-    case KvCacheStorage::Bf16KeyFp8Value: return DType::FP8_E4M3FN;
     case KvCacheStorage::Bf16KeyInt8Value: return DType::I8;
     }
     throw std::invalid_argument("unknown kv cache storage");
@@ -867,8 +860,6 @@ std::int32_t kv_cache_k_quant_group(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return 0;
     case KvCacheStorage::Int8Group64: return qwen3_6::kKvQuantGroup;
-    case KvCacheStorage::Fp8E4M3Row256: return qwen3_6::kKvFp8ScaleGroup;
-    case KvCacheStorage::Bf16KeyFp8Value: return 0;
     case KvCacheStorage::Bf16KeyInt8Value: return 0;
     }
     throw std::invalid_argument("unknown kv cache storage");
@@ -878,8 +869,6 @@ std::int32_t kv_cache_v_quant_group(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return 0;
     case KvCacheStorage::Int8Group64: return qwen3_6::kKvQuantGroup;
-    case KvCacheStorage::Fp8E4M3Row256: return qwen3_6::kKvFp8ScaleGroup;
-    case KvCacheStorage::Bf16KeyFp8Value: return qwen3_6::kKvFp8ScaleGroup;
     case KvCacheStorage::Bf16KeyInt8Value: return qwen3_6::kKvQuantGroup;
     }
     throw std::invalid_argument("unknown kv cache storage");

@@ -190,8 +190,10 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
         .block_tables = Tensor(block_tables.p, DType::I32, {logical_pages, table_rows}),
         .head_dim     = kD,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
+        .k_dtype      = DType::BF16,
+        .v_dtype      = DType::BF16,
+        .k_quant_group = 0,
+        .v_quant_group = 0,
     };
 }
 

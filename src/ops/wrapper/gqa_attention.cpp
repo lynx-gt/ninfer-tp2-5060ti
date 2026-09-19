@@ -15,9 +15,8 @@ namespace ninfer::ops {
 namespace {
 
 // fp8 (e4m3) KV 的 scale 密度：每 256 维 1 个 fp16 scale。必须与
-// ops/kernel/kv_codec_fp8.cuh 的 kKVCacheFp8Group 以及 decoder_state 的
+// decoder_state 的
 // validate_kv_side 保持一致（那里是 device 头，host TU 不能 include）。
-inline constexpr std::int32_t kFp8KvScaleGroup = 256;
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
@@ -65,19 +64,18 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
     // 支持的组合：两侧完全同档（bf16 / int8 / fp8），或 K=bf16 无 scale 配 V 的任一 8 位档
-    // （k16v8 = V e4m3；k16i8 = V i8，每 64 维 1 个 scale）。
+    // （k16i8 = V i8，每 64 维 1 个 scale）。
     // V 侧的 scale 密度由 decoder_state 的 validate_kv_side 在建池时校验，
     // 这里只看 dtype 组合（避免 ops/wrapper 依赖含 device 助手的 codec 头）。
     const bool same_side = cache.k_dtype == cache.v_dtype &&
                            cache.k_quant_group == cache.v_quant_group;
     const bool k16_8bit_v = cache.k_dtype == DType::BF16 && cache.k_quant_group == 0 &&
-                            (cache.v_dtype == DType::FP8_E4M3FN || cache.v_dtype == DType::I8);
+                            cache.v_dtype == DType::I8;
     if (!same_side && !k16_8bit_v) {
         throw std::invalid_argument(std::string(op) +
                                     ": unsupported per-side KV codec combination");
     }
-    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8 &&
-         cache.k_dtype != DType::FP8_E4M3FN) ||
+    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -86,9 +84,6 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     if (cache.k_dtype == DType::I8 && cache.k_quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
-    }
-    if (cache.k_dtype == DType::FP8_E4M3FN && cache.k_quant_group != kFp8KvScaleGroup) {
-        throw std::invalid_argument(std::string(op) + ": FP8 KV cache must use quant_group 256");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -100,7 +95,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
 
     // 两侧各自校验：plane 的 dtype 必须等于该侧 codec 的 dtype（I8 / BF16 / FP8_E4M3FN）。
-    // k16v8 = K bf16 + V e4m3，所以不能再用"两侧同 dtype"的假设。
+    // k16i8 = K bf16 + V i8，所以不能再用"两侧同 dtype"的假设。
     const DType k_code_dtype = cache.k_dtype == DType::I8 ? DType::I8 : cache.k_dtype;
     const DType v_code_dtype = cache.v_dtype == DType::I8 ? DType::I8 : cache.v_dtype;
     if (cache.k_pages.dtype != k_code_dtype || cache.v_pages.dtype != v_code_dtype) {
@@ -119,7 +114,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     require_contiguous_nonnull(cache.block_table, op, "block table");
 
     // scale 平面按侧校验：组数由该侧 codec 的 scale 密度决定（I8 每 64 维一组、FP8 每 256 维一个；
-    // bf16 侧完全没有 scale 平面）。k16v8 = K bf16（无 scale）+ V fp8（1 个 scale）正好落在这里。
+    // bf16 侧完全没有 scale 平面）。k16i8 = K bf16（无 scale）+ V i8（每 64 维 1 个 scale）正好落在这里。
     const auto require_side_scales = [&](const Tensor& scales, DType code_dtype, const char* side) {
         if (code_dtype == DType::BF16) {
             if (scales.data != nullptr) {
@@ -128,7 +123,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
             }
             return;
         }
-        const std::int32_t group = code_dtype == DType::I8 ? kQuantGroup : kFp8KvScaleGroup;
+        const std::int32_t group = kQuantGroup;
         if (scales.data == nullptr) {
             throw std::invalid_argument(std::string(op) + ": missing " + side + " scale pages");
         }
@@ -147,19 +142,18 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
     // 支持的组合：两侧完全同档（bf16 / int8 / fp8），或 K=bf16 无 scale 配 V 的任一 8 位档
-    // （k16v8 = V e4m3；k16i8 = V i8，每 64 维 1 个 scale）。
+    // （k16i8 = V i8，每 64 维 1 个 scale）。
     // V 侧的 scale 密度由 decoder_state 的 validate_kv_side 在建池时校验，
     // 这里只看 dtype 组合（避免 ops/wrapper 依赖含 device 助手的 codec 头）。
     const bool same_side = cache.k_dtype == cache.v_dtype &&
                            cache.k_quant_group == cache.v_quant_group;
     const bool k16_8bit_v = cache.k_dtype == DType::BF16 && cache.k_quant_group == 0 &&
-                            (cache.v_dtype == DType::FP8_E4M3FN || cache.v_dtype == DType::I8);
+                            cache.v_dtype == DType::I8;
     if (!same_side && !k16_8bit_v) {
         throw std::invalid_argument(std::string(op) +
                                     ": unsupported per-side KV codec combination");
     }
-    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8 &&
-         cache.k_dtype != DType::FP8_E4M3FN) ||
+    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -168,9 +162,6 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.k_dtype == DType::I8 && cache.k_quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
-    }
-    if (cache.k_dtype == DType::FP8_E4M3FN && cache.k_quant_group != kFp8KvScaleGroup) {
-        throw std::invalid_argument(std::string(op) + ": FP8 KV cache must use quant_group 256");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -183,7 +174,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
 
     // 两侧各自校验：plane 的 dtype 必须等于该侧 codec 的 dtype（I8 / BF16 / FP8_E4M3FN）。
-    // k16v8 = K bf16 + V e4m3，所以不能再用"两侧同 dtype"的假设。
+    // k16i8 = K bf16 + V i8，所以不能再用"两侧同 dtype"的假设。
     const DType k_code_dtype = cache.k_dtype == DType::I8 ? DType::I8 : cache.k_dtype;
     const DType v_code_dtype = cache.v_dtype == DType::I8 ? DType::I8 : cache.v_dtype;
     if (cache.k_pages.dtype != k_code_dtype || cache.v_pages.dtype != v_code_dtype) {
@@ -202,7 +193,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     require_contiguous_nonnull(cache.block_tables, op, "block tables");
 
     // scale 平面按侧校验：组数由该侧 codec 的 scale 密度决定（I8 每 64 维一组、FP8 每 256 维一个；
-    // bf16 侧完全没有 scale 平面）。k16v8 = K bf16（无 scale）+ V fp8（1 个 scale）正好落在这里。
+    // bf16 侧完全没有 scale 平面）。k16i8 = K bf16（无 scale）+ V i8（每 64 维 1 个 scale）正好落在这里。
     const auto require_side_scales = [&](const Tensor& scales, DType code_dtype, const char* side) {
         if (code_dtype == DType::BF16) {
             if (scales.data != nullptr) {
@@ -211,7 +202,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
             }
             return;
         }
-        const std::int32_t group = code_dtype == DType::I8 ? kQuantGroup : kFp8KvScaleGroup;
+        const std::int32_t group = kQuantGroup;
         if (scales.data == nullptr) {
             throw std::invalid_argument(std::string(op) + ": missing " + side + " scale pages");
         }
@@ -417,8 +408,6 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    // fp8 侧的 QK 走与 bf16 相同的 MMA 与 staging，workspace 尺寸也按 bf16 计（kvfp8 的 K 侧是 FP8）。
-    if (cache_dtype == DType::FP8_E4M3FN) { cache_dtype = DType::BF16; }
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||

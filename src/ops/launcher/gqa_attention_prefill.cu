@@ -23,16 +23,12 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
     // Per-device once-guard: the opt-in is a per-device kernel property.
-    const bool fp8_key   = cache.k_dtype == DType::FP8_E4M3FN;
-    const bool fp8_value = cache.v_dtype == DType::FP8_E4M3FN;
-    if (fp8_key) {
+    // k16i8：K 侧 bf16（无 scale）+ V 侧 int8（每 64 维 1 个 scale）。
+    const bool i8_value = cache.k_dtype == DType::BF16 && cache.v_dtype == DType::I8;
+    if (i8_value) {
         ensure_func_attr_per_device(
-            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true, true>,
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-    } else if (fp8_value) {
-        ensure_func_attr_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    kGqaPrefillSmemBytes);
     } else {
         ensure_func_attr_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -56,23 +52,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __half*>(cache_v_scale.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
-    } else if (fp8_key) {
-        // kvfp8：K/V 两侧都是 e4m3 + 每 256 维 1 个 fp16 scale。
+    } else if (i8_value) {
+        // k16i8：K 仍是 bf16（无 scale），V 是 int8 + 每 64 维 1 个 fp16 scale。
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
-        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true, true>
-            <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data),
-                static_cast<const __half*>(cache.k_scale_pages.data),
-                static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
-    } else if (fp8_value) {
-        // k16v8：K 仍是 bf16，V 是 e4m3 + 每 256 维 1 个 fp16 scale。
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+                                  static_cast<unsigned>(Geometry::QHeads /
+                                                        kGqaPrefillHeadsPerCta), 1u);
         gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>
             <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -83,7 +67,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+                                  static_cast<unsigned>(Geometry::QHeads /
+                                                        kGqaPrefillHeadsPerCta), 1u);
         gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
             <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -138,26 +123,8 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
                     static_cast<__half*>(cache_v_scale.data), tokens);
         }
         CUDA_CHECK(cudaGetLastError());
-    } else if (cache.k_dtype == DType::FP8_E4M3FN) {
-        // kvfp8：K/V 两侧都写 e4m3 + 每 256 维 1 个 fp16 scale。
-        constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
-        constexpr int kFillVecElems    = 8;
-        const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                                         (kGqaPrefillHeadDim / kFillVecElems);
-        const int fill_grid =
-            static_cast<int>(div_up(kv_elements, static_cast<std::int64_t>(kBlock)));
-        gqa_attention_prefill_fill_bf16_kernel<Geometry, Metadata, true, true>
-            <<<fill_grid, kBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(k.data),
-                static_cast<const __nv_bfloat16*>(v.data),
-                static_cast<const std::int32_t*>(positions.data), metadata,
-                static_cast<__nv_bfloat16*>(cache_k.data),
-                static_cast<__nv_bfloat16*>(cache_v.data),
-                static_cast<__half*>(cache.k_scale_pages.data),
-                static_cast<__half*>(cache.v_scale_pages.data), tokens);
-        CUDA_CHECK(cudaGetLastError());
-    } else if (cache.v_dtype == DType::FP8_E4M3FN) {
-        // k16v8：K 仍写 bf16，V 写 e4m3 + 每 256 维 1 个 fp16 scale。
+    } else if (cache.v_dtype == DType::I8) {
+        // k16i8：K 仍写 bf16（无 scale），V 写 int8 + 每 64 维 1 个 fp16 scale。
         constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
         constexpr int kFillVecElems    = 8;
         const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *

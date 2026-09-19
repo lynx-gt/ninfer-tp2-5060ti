@@ -28,8 +28,8 @@ struct PagedKVLayerView {
     Tensor block_table;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
-    // K/V 两侧各自独立：codec 可以不同（k16v8 = K bf16 无 scale + V e4m3 每 256 维 1 个 scale），
-    // scale 密度也不同（int8 是每 64 组、fp8 是每 256 维）。quant_group == 0 表示该侧无 scale。
+    // K/V 两侧各自独立：codec 可以不同（k16i8 = K bf16 无 scale + V int8 每 64 维 1 个 scale），
+    // scale 密度也就按侧不同。quant_group == 0 表示该侧无 scale。
     DType k_dtype             = DType::BF16;
     DType v_dtype             = DType::BF16;
     std::int32_t k_quant_group = 0;
@@ -51,8 +51,8 @@ struct PagedKVBatchLayerView {
     Tensor block_tables;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
-    // K/V 两侧各自独立：codec 可以不同（k16v8 = K bf16 无 scale + V e4m3 每 256 维 1 个 scale），
-    // scale 密度也不同（int8 是每 64 组、fp8 是每 256 维）。quant_group == 0 表示该侧无 scale。
+    // K/V 两侧各自独立：codec 可以不同（k16i8 = K bf16 无 scale + V int8 每 64 维 1 个 scale），
+    // scale 密度也就按侧不同。quant_group == 0 表示该侧无 scale。
     DType k_dtype             = DType::BF16;
     DType v_dtype             = DType::BF16;
     std::int32_t k_quant_group = 0;

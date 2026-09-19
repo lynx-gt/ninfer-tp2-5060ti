@@ -610,7 +610,8 @@ public:
         result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
-        result.dtype        = dtype_;
+        result.k_dtype      = dtype_;
+        result.v_dtype      = dtype_;
         if (dtype_ == DType::I8) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
@@ -618,7 +619,8 @@ public:
             result.v_scale_pages =
                 Tensor(v_scale_.data(), DType::FP16,
                        {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-            result.quant_group = kQuantGroup;
+            result.k_quant_group = kQuantGroup;
+            result.v_quant_group = kQuantGroup;
         }
         return result;
     }
@@ -633,8 +635,10 @@ public:
             .block_tables  = direct.block_table.view({logical_pages_, 1}),
             .head_dim      = direct.head_dim,
             .num_kv_heads  = direct.num_kv_heads,
-            .dtype         = direct.dtype,
-            .quant_group   = direct.quant_group,
+            .k_dtype       = direct.k_dtype,
+            .v_dtype       = direct.v_dtype,
+            .k_quant_group = direct.k_quant_group,
+            .v_quant_group = direct.v_quant_group,
         };
     }
 
@@ -747,7 +751,8 @@ public:
                                      {logical_pages_, static_cast<std::int32_t>(rows_)});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
-        result.dtype        = dtype_;
+        result.k_dtype      = dtype_;
+        result.v_dtype      = dtype_;
         if (dtype_ == DType::I8) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
@@ -755,7 +760,8 @@ public:
             result.v_scale_pages =
                 Tensor(v_scale_.data(), DType::FP16,
                        {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-            result.quant_group = kQuantGroup;
+            result.k_quant_group = kQuantGroup;
+            result.v_quant_group = kQuantGroup;
         }
         return result;
     }

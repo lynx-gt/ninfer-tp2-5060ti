@@ -87,8 +87,10 @@ PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
         .block_tables = Tensor(block_table.p, DType::I32, {kLogicalPages, table_rows}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
+        .k_dtype      = DType::BF16,
+        .v_dtype      = DType::BF16,
+        .k_quant_group = 0,
+        .v_quant_group = 0,
     };
 }
 

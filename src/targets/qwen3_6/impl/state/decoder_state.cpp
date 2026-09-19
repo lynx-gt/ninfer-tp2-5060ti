@@ -12,8 +12,7 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-// 单侧校验：bf16 不允许带 quant group；I8 必须每 kKvQuantGroup 一组、fp8 必须每
-// kKvFp8ScaleGroup 维一个 fp16 scale。返回该侧是否需要 scale plane。
+// 单侧校验：bf16 不允许带 quant group；I8 必须每 kKvQuantGroup 一组。返回该侧是否需要 scale plane。
 bool validate_kv_side(DType dtype, std::int32_t quant_group, std::int32_t head_dim,
                       const char* side) {
     switch (dtype) {
@@ -23,10 +22,8 @@ bool validate_kv_side(DType dtype, std::int32_t quant_group, std::int32_t head_d
                                         " bf16 must not carry a quant group");
         }
         return false;
-    case DType::I8:
-    case DType::FP8_E4M3FN: {
-        const std::int32_t expected = dtype == DType::I8 ? kKvQuantGroup : kKvFp8ScaleGroup;
-        if (quant_group != expected || head_dim % quant_group != 0) {
+    case DType::I8: {
+        if (quant_group != kKvQuantGroup || head_dim % quant_group != 0) {
             throw std::invalid_argument(std::string("Paged KV ") + side +
                                         " quant group does not match its dtype");
         }
@@ -59,7 +56,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
     // 每层 plane 顺序固定 [K code, V code, K scale?, V scale?]：单侧档位（bf16 / int8）逐 plane
-    // 与改造前完全一致；k16v8 = K bf16（无 scale）+ V fp8（每 256 维 1 个 scale）。
+    // 与改造前完全一致；k16i8 = K bf16（无 scale）+ V int8（每 64 维 1 个 scale）。
     const std::size_t per_layer = 2ULL + (k_scaled ? 1ULL : 0ULL) + (v_scaled ? 1ULL : 0ULL);
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * per_layer);
     for (std::uint32_t layer = 0; layer < layers; ++layer) {

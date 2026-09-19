@@ -18,11 +18,13 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
-#include "ops/kernel/kv_codec_fp8.cuh"
+#include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 namespace ninfer::ops {
 
-template <typename Geometry, typename Metadata, bool Fp8Value = false, bool Fp8Key = false>
+// k16i8 档：K 侧 bf16（2 B/元素、无 scale）+ V 侧 int8 code（每 64 维 1 个 fp16 scale）。
+// V 的 code 在这里解成 bf16 写进 smem，PV 的 MMA 与纯 bf16 路径完全一致。
+template <typename Geometry, typename Metadata, bool Int8Value = false>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
@@ -54,57 +56,37 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
 
     const std::int64_t cache_off = paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
         physical_page, kv_head, position & kPagedKVPageMask, d);
-    if constexpr (Fp8Key) {
-        // K 侧 fp8：与 V 侧同构，整个 256 维向量一个 fp16 scale、warp 归约 absmax。
-        const __nv_bfloat16* k_bf16 = reinterpret_cast<const __nv_bfloat16*>(&k_value);
-        float lane_absmax           = 0.0f;
-#pragma unroll
-        for (int i = 0; i < VecElems; ++i) {
-            lane_absmax = fmaxf(lane_absmax, fabsf(__bfloat162float(k_bf16[i])));
-        }
-        const KVCacheFp8QuantParams params =
-            kv_cache_fp8_quant_params(kv_cache_fp8_warp_absmax(lane_absmax));
-        auto* k_codes = reinterpret_cast<std::uint8_t*>(cache_k);
-#pragma unroll
-        for (int i = 0; i < VecElems / 2; ++i) {
-            const std::uint16_t code2 = kv_cache_fp8_quant_code2(
-                __bfloat162float(k_bf16[2 * i]), __bfloat162float(k_bf16[2 * i + 1]),
-                params.inverse_scale);
-            k_codes[cache_off + 2 * i]     = static_cast<std::uint8_t>(code2 & 0xFFu);
-            k_codes[cache_off + 2 * i + 1] = static_cast<std::uint8_t>(code2 >> 8);
-        }
-        if (lane == 0) {
-            k_scale_pages[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
-                                                             position & kPagedKVPageMask)] =
-                params.scale;
-        }
-    } else {
-        store_vec(&cache_k[cache_off], k_value);
-    }
-    if constexpr (Fp8Value) {
-        // V 侧 fp8：整个 256 维向量一个 fp16 scale。head_dim/8 == 32 个 8 元素 chunk 连续排布，
-        // 所以同一个 warp 的 32 个线程正好覆盖一个 (kv_head, token) 向量 ⇒ warp 归约 absmax。
+    store_vec(&cache_k[cache_off], k_value);
+
+    if constexpr (Int8Value) {
+        // V 侧 int8（k16i8）：每 64 维 1 个 fp16 scale。head_dim/8 == 32 个 8 元素 chunk
+        // 连续排布 ⇒ 同一 warp 的 32 个 lane 正好覆盖一个 (kv_head, token) 向量的 32 个 chunk，
+        // 而每 8 个 lane（= 一个 64 维 group）共享一个 scale ⇒ 先在 8-lane 内做三次 xor 归约。
+        // 量化/取整口径与 i8 档位完全一致（fp16 舍入后的 scale 取倒数 + round-to-nearest + 对称钳位）。
         const __nv_bfloat16* v_bf16 = reinterpret_cast<const __nv_bfloat16*>(&v_value);
         float lane_absmax           = 0.0f;
 #pragma unroll
         for (int i = 0; i < VecElems; ++i) {
             lane_absmax = fmaxf(lane_absmax, fabsf(__bfloat162float(v_bf16[i])));
         }
-        const KVCacheFp8QuantParams params =
-            kv_cache_fp8_quant_params(kv_cache_fp8_warp_absmax(lane_absmax));
-        auto* v_codes = reinterpret_cast<std::uint8_t*>(cache_v);
+        lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(0xffffffffu, lane_absmax, 1));
+        lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(0xffffffffu, lane_absmax, 2));
+        lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(0xffffffffu, lane_absmax, 4));
+        const __half v_scale = __float2half_rn(lane_absmax > 0.0f ? lane_absmax / 127.0f : 0.0f);
+        const float v_s      = __half2float(v_scale);
+        const float v_inv    = v_s > 0.0f ? 1.0f / v_s : 0.0f;
+        auto* v_codes        = reinterpret_cast<std::int8_t*>(cache_v);
+        int2 packed;
+        auto* packed_bytes = reinterpret_cast<std::int8_t*>(&packed);
 #pragma unroll
-        for (int i = 0; i < VecElems / 2; ++i) {
-            const std::uint16_t code2 = kv_cache_fp8_quant_code2(
-                __bfloat162float(v_bf16[2 * i]), __bfloat162float(v_bf16[2 * i + 1]),
-                params.inverse_scale);
-            v_codes[cache_off + 2 * i]     = static_cast<std::uint8_t>(code2 & 0xFFu);
-            v_codes[cache_off + 2 * i + 1] = static_cast<std::uint8_t>(code2 >> 8);
+        for (int i = 0; i < VecElems; ++i) {
+            packed_bytes[i] = gqa_kv_quant_code(__bfloat162float(v_bf16[i]), v_inv);
         }
-        if (lane == 0) {
-            v_scale_pages[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
-                                                             position & kPagedKVPageMask)] =
-                params.scale;
+        store_vec(&v_codes[cache_off], packed);
+        if ((lane & (kGqaKvQuantGroup / VecElems - 1)) == 0) {
+            v_scale_pages[gqa_kv_quant_scale_index<Geometry>(
+                physical_page, kv_head, d / kGqaKvQuantGroup,
+                position & kPagedKVPageMask)] = v_scale;
         }
     } else {
         store_vec(&cache_v[cache_off], v_value);
@@ -114,31 +96,34 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
 // Stage one [Bc, D] K 或 V tile 的 fp8 版本：cache 里是 8 bit e4m3 code（每 256 维 1 个 fp16
 // scale），读 8 个 code（8 B）→ 解量化成 8 个 bf16 → 写进与本文件 bf16 路径完全相同的 swizzle
 // 位置。与 bf16 路径的差别：不用 cp.async（要过一遍转换），所以是同步读写（i8 路径同款做法）。
+// Stage one [Bc, D] V tile 的 int8 版本（k16i8）：cache 里是 8 bit signed code（每 64 维 1 个
+// fp16 scale），读 8 个 code（8 B）→ 解量化成 8 个 bf16 → 写进与本文件 bf16 路径完全相同的
+// swizzle 位置。index 与解量化都复用 i8 档位的共享 helper（gqa_attention_kv_quant.cuh），
+// 保证与 int8 档位逐位同口径；同样是同步读写（不经过 cp.async）。
 template <typename Geometry>
-__device__ __forceinline__ void gqa_prefill_stage_fp8(__nv_bfloat16* dst,
-                                                     const std::uint8_t* cache_codes,
-                                                     const __half* scale_pages, int kv_head,
-                                                     int k0, int max_query_abs,
-                                                     int physical_page, int tid) {
+__device__ __forceinline__ void gqa_prefill_stage_i8value(__nv_bfloat16* dst,
+                                                         const std::int8_t* cache_codes,
+                                                         const __half* scale_pages, int kv_head,
+                                                         int k0, int max_query_abs,
+                                                         int physical_page, int tid) {
     constexpr int D         = kGqaPrefillHeadDim;
     constexpr int Bc        = kGqaPrefillBc;
     constexpr int Threads   = kGqaPrefillThreads;
-    constexpr int VecPerRow = D / 8; // 8 个 e4m3 code == 8 维
+    constexpr int VecPerRow = D / 8; // 8 个 int8 code == 8 维
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
-    const std::uint8_t* cache_block =
-        cache_codes + paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
-                          physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+    const std::int8_t* cache_block = cache_codes + gqa_kv_quant_code_index<Geometry>(
+                                                       physical_page, kv_head, 0,
+                                                       k0 & kPagedKVPageMask);
     for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-        const int key_l   = chunk >> 5;        // / VecPerRow (32)
-        const int d       = (chunk & 31) << 3; // (chunk % 32) * 8
-        __nv_bfloat16* p  = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
-        const int key     = k0 + key_l;
+        const int key_l  = chunk >> 5;        // / VecPerRow (32)
+        const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
+        __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
+        const int key    = k0 + key_l;
         if (full_tile || key <= max_query_abs) {
-            const uint2 code8  = load_vec<uint2>(&cache_block[key_l * D + d]);
-            const __half scale = scale_pages[kv_cache_fp8_scale_index<Geometry>(
-                physical_page, kv_head, key & kPagedKVPageMask)];
-            store_vec(p, kv_cache_fp8_dequant_code8_to_bf16x8(
-                             reinterpret_cast<const std::uint8_t*>(&code8), scale));
+            const __half scale = scale_pages[gqa_kv_quant_scale_index<Geometry>(
+                physical_page, kv_head, d / kGqaKvQuantGroup, key & kPagedKVPageMask)];
+            store_vec(p, gqa_kv_dequant_i8x8_from(&cache_block[key_l * D + d],
+                                                  __half2float(scale)));
         } else {
             store_vec(p, make_int4(0, 0, 0, 0));
         }
@@ -188,7 +173,7 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata, bool Fp8Value = false, bool Fp8Key = false>
+template <typename Geometry, typename Metadata, bool Int8Value = false>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ cache_k,
@@ -209,25 +194,40 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
-    static_assert(Threads == 128);
+    // GQA-aware 结构约束：每个 head 4 个 warp（每 warp 16 行、合计 64 行 = Br），
+    // 一个 CTA 覆盖 kGqaPrefillHeadsPerCta 个 head。
+    static_assert(kGqaPrefillWarpsPerHead == 4);
+    static_assert(Threads == 32 * kGqaPrefillWarpsPerHead * kGqaPrefillHeadsPerCta);
+    static_assert(Br == 16 * kGqaPrefillWarpsPerHead);
+    // 一个 Bc 宽的 key tile 必须完整落在一个 paged-KV page 内：tile 的 physical page 按 tile 起始
+    // 绝对位置取一次，page 内偏移用 k0 & kPagedKVPageMask。Bc 不能整除 page 就会跨页取到错数据。
+    static_assert(kPagedKVPageSize % Bc == 0, "Bc must divide the paged-KV page size");
 
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
     __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
-    __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
+    __nv_bfloat16* k_s = q_s + kGqaPrefillHeadsPerCta * Br * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int warp    = tid >> 5;
-    const int lane    = tid & 31;
-    const int q0      = q_block * Br;
-    const int kv_head = q_head / Geometry::GroupSize;
-    const int tokens  = metadata.valid_tokens(width);
+    const int q_block    = static_cast<int>(blockIdx.x);
+    const int q_head_base = static_cast<int>(blockIdx.y) * kGqaPrefillHeadsPerCta;
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int warp       = tid >> 5;
+    const int lane       = tid & 31;
+    const int q0         = q_block * Br;
+    // GQA-aware：一个 CTA 覆盖同一 kv_head 组内的 kGqaPrefillHeadsPerCta 个 q_head。
+    // 前 kGqaPrefillWarpsPerHead 个 warp 服务第 0 个 head，依次类推；K/V 载入全员共享。
+    const int head_slot = warp / kGqaPrefillWarpsPerHead;
+    const int q_head    = q_head_base + head_slot;
+    const int kv_head   = q_head_base / Geometry::GroupSize;
+    const int tokens    = metadata.valid_tokens(width);
 
-    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
+    if (q_head_base + kGqaPrefillHeadsPerCta > Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads);
+#pragma unroll
+        for (int s = 0; s < kGqaPrefillHeadsPerCta; ++s) {
+            gqa_prefill_zero_output_rows<Geometry>(out, q_head_base + s, q0, min(q0 + Br, width),
+                                                   tid, Threads);
+        }
         return;
     }
     const int base_pos              = positions[0];
@@ -241,14 +241,17 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const int a_rowoff  = a_rin + ((a_mat & 1) << 3);
     const int b_rin     = lane & 7;
     const int b_koff    = ((lane >> 3) & 1) << 3;
-    const int warp_row0 = warp * 16; // this warp owns rows [warp_row0, warp_row0+16)
+    // 本 warp 在自己 head 的 64 行里拥有的 16 行（kGqaPrefillWarpsPerHead == 4 时即 16 行/warp）
+    const int warp_row0 = (warp % kGqaPrefillWarpsPerHead) * 16;
 
     // Per-lane precomputed swizzled ldmatrix base addresses (see gqa_prefill_swz_addr).
     const unsigned q_sbase = smem_addr(q_s);
     const unsigned k_sbase = smem_addr(k_s);
     const unsigned v_sbase = smem_addr(v_s);
     // Q A-fragment: row = warp_row0 + a_rowoff, col = k*16 + a_coloff.
-    const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
+    // 每个 head 一个 Q tile（q_s 里连续排布），head_slot 决定本 warp 读哪一块。
+    const unsigned q_lane_base = q_sbase + static_cast<unsigned>(head_slot * Br * D * 2) +
+                                 static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
     const unsigned q_r         = static_cast<unsigned>(a_rin << 4);
     // K B-fragment via ldmatrix.x4 (2 n-tiles/instr): lanes 16-31 fetch the +8-key
@@ -268,27 +271,31 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     // below); it stays resident for the whole key loop. Global Q rows are 256 bf16
     // contiguous, with a token stride of 256*QHeads.
     {
-        constexpr int VecPerRow      = D / 8;
-        constexpr int QRowStride     = D * Geometry::QHeads; // global stride between tokens
-        const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
-        if (q0 + Br <= tokens) {
+        constexpr int VecPerRow  = D / 8;
+        constexpr int QRowStride = D * Geometry::QHeads; // global stride between tokens
 #pragma unroll
-            for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
-                const int row    = chunk >> 5;
-                const int d      = (chunk & 31) << 3;
-                __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
-                cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
-            }
-        } else {
+        for (int h = 0; h < kGqaPrefillHeadsPerCta; ++h) {
+            const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head_base + h, 0, q0);
+            __nv_bfloat16* q_dst         = q_s + h * Br * D;
+            if (q0 + Br <= tokens) {
 #pragma unroll
-            for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
-                const int row    = chunk >> 5;
-                const int d      = (chunk & 31) << 3;
-                __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
-                if (q0 + row < tokens) {
+                for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                    const int row    = chunk >> 5;
+                    const int d      = (chunk & 31) << 3;
+                    __nv_bfloat16* p = &q_dst[row * D + gqa_prefill_swz(row, d)];
                     cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
-                } else {
-                    store_vec(p, make_int4(0, 0, 0, 0));
+                }
+            } else {
+#pragma unroll
+                for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                    const int row    = chunk >> 5;
+                    const int d      = (chunk & 31) << 3;
+                    __nv_bfloat16* p = &q_dst[row * D + gqa_prefill_swz(row, d)];
+                    if (q0 + row < tokens) {
+                        cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                    } else {
+                        store_vec(p, make_int4(0, 0, 0, 0));
+                    }
                 }
             }
         }
@@ -313,27 +320,25 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    if constexpr (Fp8Key) {
-        gqa_prefill_stage_fp8<Geometry>(k_s, reinterpret_cast<const std::uint8_t*>(cache_k),
-                                        k_scale_pages, kv_head, 0, max_query_abs, physical_page,
-                                        tid);
-    } else {
-        gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
-    }
+    gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+
     ninfer::ops::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
+        const int next_k0            = k0 + Bc;
+        const int next_physical_page = (kb + 1 < n_block_max)
+                                           ? block_table[next_k0 >> kPagedKVPageShift]
+                                           : physical_page;
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        if constexpr (Fp8Value) {
-            gqa_prefill_stage_fp8<Geometry>(v_s, reinterpret_cast<const std::uint8_t*>(cache_v),
-                                            v_scale_pages, kv_head, k0, max_query_abs,
-                                            physical_page, tid);
+        if constexpr (Int8Value) {
+            gqa_prefill_stage_i8value<Geometry>(v_s, reinterpret_cast<const std::int8_t*>(cache_v),
+                                                v_scale_pages, kv_head, k0, max_query_abs,
+                                                physical_page, tid);
         } else {
             gqa_prefill_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs,
                                            physical_page, tid);
@@ -492,14 +497,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            if constexpr (Fp8Key) {
-                gqa_prefill_stage_fp8<Geometry>(k_s, reinterpret_cast<const std::uint8_t*>(cache_k),
-                                                k_scale_pages, kv_head, (kb + 1) * Bc,
-                                                max_query_abs, physical_page, tid);
-            } else {
-                gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                               physical_page, tid);
-            }
+            gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+                               physical_page, tid);
+
             ninfer::ops::cp_commit();
         }
 
@@ -557,7 +557,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
-    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
+#pragma unroll
+    for (int s = 0; s < kGqaPrefillHeadsPerCta; ++s) {
+        gqa_prefill_zero_output_rows<Geometry>(out, q_head_base + s, tokens, min(q0 + Br, width),
+                                               tid, Threads);
+    }
 }
 
 } // namespace ninfer::ops

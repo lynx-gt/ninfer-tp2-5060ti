@@ -11,8 +11,6 @@
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
-// fp8 (E4M3FN) KV 的 scale 密度：每个 256 维向量 1 个 fp16 scale（对齐上游 row256 codec）。
-inline constexpr std::int32_t kKvFp8ScaleGroup = 256;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
