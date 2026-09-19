@@ -72,6 +72,8 @@ __global__ __launch_bounds__(
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
+// The gate/up epilogue owns its own row mapping; only the K-loop phase crosses over at T>=5
+// (measurement in nvfp4_config.h).
 template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int kIntermediate             = Geometry::kOutputRows / 2;

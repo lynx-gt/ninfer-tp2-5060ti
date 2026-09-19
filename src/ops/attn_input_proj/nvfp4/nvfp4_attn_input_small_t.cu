@@ -49,6 +49,7 @@ struct Nvfp4AttentionInputSmallTOutput {
 
 // The four-output epilogue shifts the measured low-T warp crossover relative to contiguous Linear,
 // so Attention owns this production mapping even though both routes share the compute body.
+// Fork note: rows-per-warp and K-loop phase cross over at T>=5, as measured for nvfp4_config.h.
 template <int ActiveTokens>
 struct Nvfp4AttentionSmallTProductionSchedule {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);

@@ -263,6 +263,13 @@ inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
 // RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
 // through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
 // are measured occupancy/register crossovers, not semantic frontiers.
+//
+// Fork note (2x RTX 5060 Ti, measured 2026-09-20): the warp-count crossovers carry over unchanged
+// (4 warps -0.9%, 16 warps -12.7% at T=4), but the row and phase settings cross over at T=5. Four
+// rows per warp and a two-phase unrolled K loop each measure ~1% on decode and 1.27% together, and
+// both were verified bit-exact against the 2-row / 1-phase schedule (T=5, T=6, short prompts whose
+// prefill lands on T=15/20/28, and 138k context). T<=4 keeps the upstream schedule so the shipped
+// MTP3 (T=4) path compiles to the same kernel. Screened 20 candidates at a +/-0.15% noise floor.
 template <class Geometry, int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
