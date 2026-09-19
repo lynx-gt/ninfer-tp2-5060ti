@@ -382,8 +382,11 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
         width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
-    if (q_heads == 16 && width <= kMaximumVerifyTokens &&
-        envelope.max_visible_keys > prompt_visible_keys) {
+    // 注册的全部 geometry（24|4、16|2、12|2）都允许走分块 small_t：原条件只放行 16，
+    // 会把 27B（tp1 24 头 / tp2 每卡 12 头）上宽 7..16 的 verify 错送到无 split 的
+    // Prompt kernel（grid 1x12x1 单块串行扫全 KV，8k 上下文实测 359us/层，
+    // 是 small_t split 路径的 7 倍）。
+    if (width <= kMaximumVerifyTokens && envelope.max_visible_keys > prompt_visible_keys) {
         return GqaAttentionRoute::ChunkedSmallT;
     }
     return GqaAttentionRoute::Prompt;

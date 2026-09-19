@@ -53,6 +53,7 @@ Artifact and model references:
 - [Persistent storage layouts](maintainer/storage-layouts.md)
 - [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
+- [Qwen3.8-27B DFlash2 mathematics and Engine state contract](maintainer/qwen3.8-27b-dflash2.md)
 - [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)
 - [Qwen3.8-27B W4A4 NVFP4 artifact (the TP2-validated build)](maintainer/qwen3.8-27b-w4a4-artifact.md)
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)

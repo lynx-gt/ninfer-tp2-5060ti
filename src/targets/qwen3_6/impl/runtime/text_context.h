@@ -317,6 +317,19 @@ public:
                              const std::array<Tensor, 2>& hidden,
                              const std::array<Tensor, 2>& logits,
                              const std::array<Tensor, 2>& target_tokens);
+    // DFlash2 的 feature-sink 版本：sink 只在 rank 0 上存在（草稿只在那边跑），所以这里收单份引用
+    // 而不是 array。rank 1 的 feature_sink 必须为空 —— 传进来就说明调用方搞错了 device。
+    void target_verify_batch(const std::array<Tensor, 2>& ids,
+                             const std::array<Tensor, 2>& cache_positions,
+                             const std::array<Tensor, 2>& rope_positions,
+                             const std::array<Tensor, 2>& valid_columns,
+                             const std::array<Tensor, 2>& kv_table_rows,
+                             const std::array<Tensor, 2>& linear_state_slots,
+                             ops::GqaExecutionEnvelope envelope,
+                             const std::array<Tensor, 2>& hidden,
+                             const std::array<Tensor, 2>& logits,
+                             const std::array<Tensor, 2>& target_tokens,
+                             DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                   const std::array<Tensor, 2>& cache_positions,
                                   const std::array<Tensor, 2>& rope_positions,
@@ -392,6 +405,11 @@ private:
                       const std::array<Tensor, 2>& staging);
     void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
                         const std::array<Tensor, 2>& staging);
+    // DFlash2 的 feature tap 版本：只捕获 rank 0 的残差。理由见此处签名下方注释 —— tp2 的 x 是
+    // 两卡逐位复制的全宽 hidden，而草稿只在 rank 0 上跑（rank 1 只参与最终半词表 top-k）。
+    template <class Tap>
+    void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
+                        const std::array<Tensor, 2>& staging, Tap& tap);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
@@ -447,6 +465,17 @@ private:
                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
+    template <class Tap>
+    void target_verify_batch_impl_tp2(const std::array<Tensor, 2>& ids,
+                                      const std::array<Tensor, 2>& cache_positions,
+                                      const std::array<Tensor, 2>& rope_positions,
+                                      const std::array<Tensor, 2>& valid_columns,
+                                      const std::array<Tensor, 2>& kv_table_rows,
+                                      const std::array<Tensor, 2>& linear_state_slots,
+                                      ops::GqaExecutionEnvelope envelope,
+                                      const std::array<Tensor, 2>& hidden,
+                                      const std::array<Tensor, 2>& logits,
+                                      const std::array<Tensor, 2>& target_tokens, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -483,6 +512,11 @@ private:
     // TextPrefill, which is declared just above this line.
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                       const TextPrefill& text_prefill,
+                                                      bool finalize_at_end);
+    // DFlash2 的 feature tap 版本（见 run_layers_tp2 的说明：只捕获 rank 0）。
+    template <class Tap>
+    [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
+                                                      const TextPrefill& text_prefill, Tap& tap,
                                                       bool finalize_at_end);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;

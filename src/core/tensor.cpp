@@ -1,5 +1,8 @@
 #include "core/tensor.h"
 
+#include <cstdio>
+#include <execinfo.h>
+
 #include <array>
 #include <limits>
 #include <stdexcept>

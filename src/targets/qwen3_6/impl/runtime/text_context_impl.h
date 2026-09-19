@@ -1418,7 +1418,9 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     if (tp2()) {
-        throw std::logic_error("DFlash prefill has no tensor-parallel path in this build");
+        const TextPrefill tp2_prefill{full_ids, begin};
+        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), tp2_prefill, sink,
+                                finalize_at_end);
     }
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
@@ -1847,6 +1849,13 @@ void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_nor
 
 void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                                  const std::array<Tensor, 2>& staging) {
+    NullTap tap;
+    run_layers_tp2(x, ph, staging, tap);
+}
+
+template <class Tap>
+void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
+                                 const std::array<Tensor, 2>& staging, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
@@ -1871,6 +1880,11 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 auto scope_0 = work_.scope();
                 auto scope_1 = tp_->work->scope();
                 mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
+                // 捕获 rank 0：tp2 的残差在两卡上逐位相同（见 text_context.h 的复制性说明），
+                // 草稿又只在 rank 0 上跑，抓一份就够。同一 stream 上的顺序保证残差已经算完。
+                if constexpr (Tap::enabled) {
+                    tap.capture_layer(layer, x[0], stream_for(0));
+                }
             }
         } else {
             const auto gidx    = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
@@ -1894,6 +1908,9 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 auto scope_0 = work_.scope();
                 auto scope_1 = tp_->work->scope();
                 mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
+                if constexpr (Tap::enabled) {
+                    tap.capture_layer(layer, x[0], stream_for(0));
+                }
             }
         }
     }
@@ -1942,6 +1959,14 @@ void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits
 
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
+                                                 bool finalize_at_end) {
+    NullTap tap;
+    return prefill_impl_tp2(ids, text_prefill, tap, finalize_at_end);
+}
+
+template <class Tap>
+PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
+                                                 const TextPrefill& text_prefill, Tap& tap,
                                                  bool finalize_at_end) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -2010,6 +2035,8 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             ops::fill_i32_positions(positions[r], base_i, s);
             ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_, x[r], s);
         });
+        // DFlash2 的提示特征：只取 rank 0（残差在两卡上逐位相同，草稿只在 rank 0 上跑）。
+        if constexpr (Tap::enabled) { tap.begin(x[0]); }
 
         ScopedValue<const Tensor*> peer_cache(peer_cache_positions_, &positions[1]);
         ScopedValue<const Tensor*> peer_rope(peer_rope_positions_, &positions[1]);
@@ -2021,7 +2048,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging);
+        run_layers_tp2(x, Phase::Prefill, staging, tap);
+        if constexpr (requires { tap.capture_positions(positions[0], stream_for(0)); }) {
+            tap.capture_positions(positions[0], stream_for(0));
+        }
 
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
@@ -2149,6 +2179,12 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                        checkpoint_hidden.data, checkpoint_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, ctx_.stream));
         }
+    }
+
+    if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+        work_.reset();
+        tp_->work->reset();
+        tap.consume_prefill_chunk(len, checkpoint_rel > 0 && len == checkpoint_rel);
     }
 
     if (checkpoint_rel > 0 && len == checkpoint_rel) {
@@ -2526,6 +2562,40 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
                                       const std::array<Tensor, 2>& hidden,
                                       const std::array<Tensor, 2>& logits,
                                       const std::array<Tensor, 2>& target_tokens) {
+    NullTap tap;
+    target_verify_batch_impl_tp2(ids, cache_positions, rope_positions, valid_columns,
+                                 kv_table_rows, linear_state_slots, envelope, hidden, logits,
+                                 target_tokens, tap);
+}
+
+void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
+                                      const std::array<Tensor, 2>& cache_positions,
+                                      const std::array<Tensor, 2>& rope_positions,
+                                      const std::array<Tensor, 2>& valid_columns,
+                                      const std::array<Tensor, 2>& kv_table_rows,
+                                      const std::array<Tensor, 2>& linear_state_slots,
+                                      ops::GqaExecutionEnvelope envelope,
+                                      const std::array<Tensor, 2>& hidden,
+                                      const std::array<Tensor, 2>& logits,
+                                      const std::array<Tensor, 2>& target_tokens,
+                                      DFlashFeatureSink& sink) {
+    target_verify_batch_impl_tp2(ids, cache_positions, rope_positions, valid_columns,
+                                 kv_table_rows, linear_state_slots, envelope, hidden, logits,
+                                 target_tokens, sink);
+}
+
+template <class Tap>
+void TextContext::target_verify_batch_impl_tp2(const std::array<Tensor, 2>& ids,
+                                               const std::array<Tensor, 2>& cache_positions,
+                                               const std::array<Tensor, 2>& rope_positions,
+                                               const std::array<Tensor, 2>& valid_columns,
+                                               const std::array<Tensor, 2>& kv_table_rows,
+                                               const std::array<Tensor, 2>& linear_state_slots,
+                                               ops::GqaExecutionEnvelope envelope,
+                                               const std::array<Tensor, 2>& hidden,
+                                               const std::array<Tensor, 2>& logits,
+                                               const std::array<Tensor, 2>& target_tokens,
+                                               Tap& tap) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution       = ec();
     const std::array<WorkspaceArena*, 2> ws = workspaces();
@@ -2593,7 +2663,11 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
             Tensor flat_ids = ids[r].view({columns});
             ops::embedding(flat_ids, rank == 0 ? *embed_ : *embed_peer_, x[r], stream_for(rank));
         });
-        run_layers_tp2(x, Phase::Verify, staging);
+        if constexpr (Tap::enabled) { tap.begin(x[0]); }
+        run_layers_tp2(x, Phase::Verify, staging, tap);
+        if constexpr (requires { tap.capture_positions(cache_positions[0], stream_for(0)); }) {
+            tap.capture_positions(cache_positions[0], stream_for(0));
+        }
 
         std::array<Tensor, 2> flat_hidden;
         std::array<Tensor, 2> flat_logits;

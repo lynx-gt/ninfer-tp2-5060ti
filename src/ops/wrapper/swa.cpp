@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <cstdio>
 
 namespace ninfer::ops {
 namespace {
@@ -37,7 +38,9 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        // DFlash2 草稿的滑窗容量是 2048（其 checkpoint 的 sliding_window），35B 用 4096。
+        (context.capacity != 2048 && context.capacity != kWindow) ||
+        context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
@@ -131,6 +134,18 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
         throw std::invalid_argument("swa: scale must be 1/sqrt(128)");
     }
 
+    // [dbg] 临时：读侧运行期上下文参数（host 侧，capture 安全）
+    {
+        static int dbg_swa = 0;
+        if (dbg_swa < 4) {
+            ++dbg_swa;
+            std::fprintf(stderr,
+                         "[dbg] swa %d: cap=%u padded=%u lanes=%d head_dim=%d env=[%u,%u]\n",
+                         dbg_swa, context.capacity, context.padded_capacity,
+                         context.lane_capacity, context.head_dim, envelope.min_context,
+                         envelope.max_context);
+        }
+    }
     auto scope               = workspace.scope();
     const auto plan          = detail::swa_resolve_plan(tokens, envelope);
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);

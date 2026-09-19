@@ -1,5 +1,7 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 
+#include <cstdio>
+
 #include "ops/launcher/prepare_ragged_prefix.h"
 
 #include <cstdint>

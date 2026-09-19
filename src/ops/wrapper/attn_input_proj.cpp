@@ -48,13 +48,15 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
     }
 }
 
-void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
+void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label,
+                         std::int32_t hidden = 2048) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 2048 || weight.shape[0] != rows ||
-        weight.shape[1] != 2048 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 2048 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+        weight.ndim != 2 || weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
+        weight.shape[1] != hidden || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != hidden || weight.qhigh != nullptr ||
+        weight.high_plane_bytes != 0 || !aligned_to(weight.qdata, 16) ||
+        !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
 }
@@ -254,17 +256,21 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 1024;
     constexpr std::int32_t kRows   = 6144;
+    const std::int32_t kHidden     = x.ne[0];
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    // 35B DFlash 草稿 hidden=2048；27B DFlash2 草稿 hidden=5120（同一 Q/K/V 融合行序）。
+    if (kHidden != 2048 && kHidden != 5120) {
+        throw std::invalid_argument("attn_input_proj: unsupported W8 Q/K/V profile");
+    }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
-    require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
+    require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight", kHidden);
 
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }

@@ -66,6 +66,10 @@ public:
 
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
 
+    // Copies one slot's complete fixed state (上游 master 的 DFlash2 路径使用)。
+    void copy_slot_from(const CyclicKVCache& source, std::int32_t source_slot,
+                        std::int32_t destination_slot, cudaStream_t stream);
+
     // Copies one lane's complete fixed state. Source and destination must have identical layouts.
     void copy_lane_from(const CyclicKVCache& source, std::int32_t lane, cudaStream_t stream);
 

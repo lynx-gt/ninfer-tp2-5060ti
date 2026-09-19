@@ -17,6 +17,7 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    kSamplePurposeDFlash2Proposal       = 5,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
@@ -75,5 +76,9 @@ struct SamplingConfig {
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
+
+
+// 把 token_ids（连续非空 I32 向量）里的每个 id 累加到 token_counts（[token_domain] I32 计数）
+void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
 
 } // namespace ninfer::ops

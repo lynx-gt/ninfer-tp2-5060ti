@@ -185,7 +185,7 @@ struct MtpGqaEnvelopes {
 
 struct DFlashEnvelopes {
     ops::SwaContextExecutionEnvelope local;
-    ops::GqaContextExecutionEnvelope full;
+    ops::GqaExecutionEnvelope full;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
@@ -195,12 +195,18 @@ struct TargetVerifyFrameView {
     Tensor rope_positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
+    // 上游 master 的 DFlash2 用状态槽（source/destination）驱动 SSM 状态交接；
+    // 本 fork 的验证路径按 lane 索引做 scatter，两者在 DFlash2 的调用点同时给出。
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
     Tensor lanes;
     Tensor target_hidden;
     Tensor target_logits;
     Tensor target_tokens;
     Tensor drafts;
     Tensor current_extents;
+    Tensor candidate_ids;
+    Tensor proposal_q;
     Tensor frontiers;
     Tensor anchors;
     Tensor licensed_tokens;
