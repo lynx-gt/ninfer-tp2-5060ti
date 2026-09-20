@@ -99,6 +99,8 @@ double parse_yarn_factor(const char* text) {
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
+    // 合并 tp2-master 时被旧侧覆盖丢掉过（枚举值一直在，CLI 选不到档）。
+    if (text == "k16i8") { return KvCacheStorage::Bf16KeyInt8Value; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 

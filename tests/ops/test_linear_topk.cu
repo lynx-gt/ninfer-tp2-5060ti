@@ -291,7 +291,7 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
     WorkspaceArena workspace(ops::linear_topk_workspace_capacity_bytes(
         fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns));
     if (id_map)
-        ops::linear_topk(x, fixture.weight, *id_map, out_ids, out_scores, workspace, nullptr);
+        ops::linear_topk(x, fixture.weight, *id_map, 0, out_ids, out_scores, workspace, nullptr);
     else
         ops::linear_topk(x, fixture.weight, kValidRows, out_ids, out_scores, workspace, nullptr);
     cuda_synchronize();
@@ -428,7 +428,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
         out_ids.fill(0xcd);
         out_scores.fill(0xff);
-        ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, ids_tensor, scores_tensor,
+        ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, 0, ids_tensor, scores_tensor,
                          point_workspace, nullptr);
         cuda_synchronize();
         failures += verify_invocation("q4-optimized", columns, ids_tensor, scores_tensor,
@@ -456,8 +456,8 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         cuda_check(cudaStreamCreate(&stream), "linear_topk create graph stream");
         replay_graph_twice(
             [&](cudaStream_t captured_stream) {
-                ops::linear_topk(graph_hidden, fixture.weight, map_tensor, graph_ids, graph_scores,
-                                 workspace, captured_stream);
+                ops::linear_topk(graph_hidden, fixture.weight, map_tensor, 0, graph_ids,
+                                 graph_scores, workspace, captured_stream);
             },
             stream);
         cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");

@@ -69,6 +69,8 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
+    // 合并 tp2-master 时这个字面量被旧侧覆盖掉了（枚举值一直在，CLI 选不到档 ⇒ 定版用不了 k16i8）。
+    if (value == "k16i8") { return KvCacheStorage::Bf16KeyInt8Value; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -144,10 +146,12 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
-           "       Prefix reuse is unavailable at --tp 2 with --spec mtp: the MTP bridge\n"
-           "       resumes from a retained target hidden that only the primary device\n"
-           "       holds, so such requests are prefilled again instead of resumed. The\n"
-           "       answer is unchanged; only the saving is lost.\n"
+           "       Prefix reuse also covers --tp 2 with --spec mtp: the MTP bridge resumes\n"
+           "       from the retained target hidden state, so a request that extends a prefix\n"
+           "       the engine still holds is resumed instead of prefilled from the start.\n"
+           "       A resubmission whose reusable prefix already covers the whole prompt has\n"
+           "       no suffix to compute and is prefilled again. The answer is unchanged\n"
+           "       either way; only the reuse saving can be lost.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"

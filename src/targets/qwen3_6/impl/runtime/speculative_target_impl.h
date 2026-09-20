@@ -79,6 +79,38 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  {frame.target_logits, peer.target_logits},
                                  {frame.target_tokens, peer.target_tokens});
     }
+    // [FIX-SPARSE-TP2] DFlash2 的 candidate_ids / proposal_q 只由 rank 0 的 selector 写出（草稿全程只在 rank 0 跑），
+    // 但两卡都要各自跑一次接受判定来推进自己的 state 与 anchor。必须先把这两张小表按 p2p 补给 peer：
+    // 否则 rank 1 读到全 0 的表 ⇒ qd=0 ⇒ `pd >= qd` 恒真 ⇒ 草稿被全部接受 ⇒ 两卡的 KV/位置随轮次
+    // 发散，而 tp2 注意力要两卡 KV 一起算 ⇒ 后续 logits 被污染、提交的 token 出错。
+    // 实测症状：只有"dflash2 + 采样"这一格会出现缺 `=`/重复词；贪心不受影响，因为贪心核不读 q。
+    if (frame.candidate_ids.data != nullptr && frame.proposal_q.data != nullptr &&
+        peer.candidate_ids.data != nullptr && peer.proposal_q.data != nullptr &&
+        frame.drafts.data != nullptr && peer.drafts.data != nullptr) {
+        const TpPeerCore& peer_core = *execution.peer;
+        CUDA_CHECK(cudaEventRecord(peer_core.events->inputs_ready(0), execution.device.stream));
+        CUDA_CHECK(cudaSetDevice(peer_core.device->device));
+        CUDA_CHECK(
+            cudaStreamWaitEvent(peer_core.device->stream, peer_core.events->inputs_ready(0), 0));
+        CUDA_CHECK(cudaMemcpyAsync(peer.candidate_ids.data, frame.candidate_ids.data,
+                                   peer.candidate_ids.bytes(), cudaMemcpyDeviceToDevice,
+                                   peer_core.device->stream));
+        CUDA_CHECK(cudaMemcpyAsync(peer.proposal_q.data, frame.proposal_q.data,
+                                   peer.proposal_q.bytes(), cudaMemcpyDeviceToDevice,
+                                   peer_core.device->stream));
+        // `drafts` / `current_extents` 同样是 rank 1 判定所需：实测 rank 1 的 drafts 会**落后一整轮**
+        // （草稿只在 rank 0 产出），两卡因此对同一轮给出不同裁决，KV 回滚量不同 ⇒ 仍会发散。
+        CUDA_CHECK(cudaMemcpyAsync(peer.drafts.data, frame.drafts.data, peer.drafts.bytes(),
+                                   cudaMemcpyDeviceToDevice, peer_core.device->stream));
+        CUDA_CHECK(cudaMemcpyAsync(peer.current_extents.data, frame.current_extents.data,
+                                   peer.current_extents.bytes(), cudaMemcpyDeviceToDevice,
+                                   peer_core.device->stream));
+        CUDA_CHECK(cudaEventRecord(peer_core.events->inputs_ready(1), peer_core.device->stream));
+        CUDA_CHECK(cudaSetDevice(execution.device.device));
+        CUDA_CHECK(
+            cudaStreamWaitEvent(execution.device.stream, peer_core.events->inputs_ready(1), 0));
+    }
+
     const ExecutionContext& ec      = *execution.peer->execution;
     WorkspaceArena* work[2]         = {&execution.work, execution.peer->work};
     TargetVerifyFrameView* views[2] = {&frame, &peer};

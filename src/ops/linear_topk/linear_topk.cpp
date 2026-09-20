@@ -51,7 +51,10 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return HeadProfile::Fp8Full;
     }
-    if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4G64_F16S) {
+    // tp2 下优化头同样是行分片（每卡 kLinearTopKOptimizedRows/2），profile 与整表相同。
+    if ((head_rows == detail::kLinearTopKOptimizedRows ||
+         head_rows == detail::kLinearTopKOptimizedRows / 2) &&
+        qtype == QType::Q4G64_F16S) {
         return HeadProfile::Q4Optimized;
     }
     throw std::invalid_argument("linear_topk: unsupported head profile");
@@ -133,14 +136,22 @@ void require_w8(const Weight& head) {
 }
 
 void require_q4(const Weight& head) {
+    // tp2 的行分片头：每卡 kLinearTopKOptimizedRows / 2 行，形状约定与整表一致。
+    const bool shard_rows = head.n == detail::kLinearTopKOptimizedRows / 2;
     const bool common =
         head.qtype == QType::Q4G64_F16S && head.layout == QuantLayout::RowSplit &&
         head.scale_dtype == DType::FP16 && head.group_size == 64 && head.group == 64 &&
-        head.ndim == 2 && head.n == detail::kLinearTopKOptimizedRows &&
+        head.ndim == 2 &&
+        (head.n == detail::kLinearTopKOptimizedRows || shard_rows) &&
         head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
     if (!common) { throw std::invalid_argument("linear_topk: invalid Q4 optimized head"); }
+    // 行数必须整除 producer 行块：K-split 路由一个 CTA 归约 kLinearTopKDirectRows 行，m64 路由
+    // 一个 CTA 归约 64 行。不整除时 grid 会多铺一块，越界读权重平面（见 q4.cu 的 blocks 取法）。
+    if (head.n % detail::kLinearTopKDirectRows != 0 || head.n % 64 != 0) {
+        throw std::invalid_argument("linear_topk: optimized head rows are not a producer multiple");
+    }
 }
 
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
@@ -196,7 +207,7 @@ Tensor column_slice(const Tensor& tensor, int first, int columns) {
 
 void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Tensor& ids,
              Tensor& scores, WorkspaceArena& workspace, cudaStream_t stream,
-             std::int32_t valid_rows) {
+             std::int32_t valid_rows, std::int32_t map_row_base = 0) {
     const auto profile = resolve_profile(head.qtype, head.n, head.k);
     for (int first = 0; first < hidden.ne[1];) {
         const int columns  = std::min(detail::kLinearTopKMaxChunkColumns, hidden.ne[1] - first);
@@ -216,7 +227,7 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
             detail::linear_topk_fp8_launch(x, head, valid_rows, scratch,
                                            stream);
         else
-            detail::linear_topk_q4_launch(x, head, *id_map, scratch, stream);
+            detail::linear_topk_q4_launch(x, head, *id_map, map_row_base, scratch, stream);
         detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
         first += columns;
     }
@@ -276,22 +287,28 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
 }
 
 void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
-                 Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
-                 cudaStream_t stream) {
+                 std::int32_t map_row_base, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
     if (resolve_profile(head.qtype, head.n, head.k) != HeadProfile::Q4Optimized) {
         throw std::invalid_argument("linear_topk: invalid optimized-head profile");
     }
     require_q4(head);
+    // 映射表永远是**整表**：tp2 分片的是头，表在每张卡上都是完整副本（赢得的那一行可能落在任意
+    // 一半里）。本卡第 i 行因此取 row_to_global_ids[map_row_base + i]，表本身不切、不偏移。
     require_matrix(row_to_global_ids, DType::I32, detail::kLinearTopKOptimizedRows, 1,
                    "row_to_global_ids", 4);
+    if (map_row_base < 0 ||
+        static_cast<std::int64_t>(map_row_base) + head.n > row_to_global_ids.ne[0]) {
+        throw std::invalid_argument("linear_topk: id map does not cover the head shard");
+    }
     if (overlaps(hidden, row_to_global_ids) || overlaps(candidate_ids, row_to_global_ids) ||
         overlaps(candidate_scores, row_to_global_ids)) {
         throw std::invalid_argument("linear_topk: id map overlaps input or output");
     }
 
     execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream,
-            head.n);
+            head.n, map_row_base);
 }
 
 } // namespace ninfer::ops

@@ -28,24 +28,6 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
-            // [dbg] 临时：prefill 的 context 写入后，看 draft 环 layer0 的 K 平面有多少非零字节。
-            {
-                static int dbg_appends = 0;
-                if (++dbg_appends <= 6) {
-                    const auto& view = state.dflash->local_layer(0);
-                    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
-                    std::vector<std::uint8_t> buf(static_cast<std::size_t>(view.k.bytes()), 0);
-                    CUDA_CHECK(cudaMemcpy(buf.data(), view.k.data, view.k.bytes(),
-                                          cudaMemcpyDeviceToHost));
-                    std::size_t nonzero = 0;
-                    for (std::uint8_t b : buf) {
-                        if (b != 0) { ++nonzero; }
-                    }
-                    std::fprintf(stderr,
-                                 "[dbg] prefill append %d: token_width=%d kvK bytes=%zu nonzero=%zu\n",
-                                 dbg_appends, exact, buf.size(), nonzero);
-                }
-            }
             if (rewrite_checkpoint) {
                 state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->active_lanes[0],
                                                       state.execution.device.stream);

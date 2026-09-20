@@ -166,7 +166,9 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
             const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
             const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
                                               kSamplePurposeSpeculativeAccept, 0);
-            reject         = !(pd >= qd || u * qd < pd);
+            // [FIX-SPARSE-GUARD] 契约要求"草稿 token 出现在候选表里且 q>0"；前提被破坏时
+            // `pd >= qd` 会因 qd=0 恒真而变成"全接受"。这里按 one-hot 兜底，绝不因查表失败放宽。
+            reject         = qd > 0.0f ? !(pd >= qd || u * qd < pd) : !(u < pd);
         }
     }
     const unsigned failures = __ballot_sync(0xffffffffU, reject);

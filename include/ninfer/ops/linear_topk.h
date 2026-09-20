@@ -54,11 +54,18 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
  *
  * @details The tensor contract is the same as the full-head overload except that `head` is
  * Q4G64_F16S `[131072,5120]` and every head row participates. `row_to_global_ids` is contiguous
- * I32 `[131072]`; it contains distinct ids in `[0,248077)` and maps each local head row to the id
+ * I32 `[131072]`; it contains distinct ids in `[0,248077)` and maps each head row to the id
  * used for output and tie-breaking. Artifact binding establishes the map's range and uniqueness.
+ *
+ * Under tensor parallelism the head is a ROW SHARD of that same logical head: `head.n` is the
+ * shard's row count and `map_row_base` is the shard's first row in the logical head, so shard row
+ * `i` is mapped through `row_to_global_ids[map_row_base + i]` and the candidates come out as
+ * global token ids either way. The map itself is never sharded -- it is replicated on every
+ * device, because the winning id can name a row held by any shard. `map_row_base` is 0 when the
+ * head is not sharded.
  */
 void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
-                 Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
-                 cudaStream_t stream);
+                 std::int32_t map_row_base, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

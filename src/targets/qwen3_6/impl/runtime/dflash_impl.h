@@ -166,30 +166,6 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                                         local_positions, local_counts, lanes, layers,
                                         {local_envelope.min_count, local_envelope.max_count},
                                         state.execution.work, state.execution.device.stream);
-            // [dbg] 临时（仅 prefill）：① 打印 draft 环 layer0 K 平面哈希（比较不同 context 是否真的不同）
-            // ② NINFER_DBG_NOCTX=1 时把整环清零，用来判定"读侧是否真的在消费这份 KV"。
-            if constexpr (std::is_same_v<Context, PrefillContext>) {
-                static int dbg_ctx = 0;
-                if (++dbg_ctx <= 4) {
-                    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
-                    const auto& view = dflash_state(state).local_layer(0);
-                    std::vector<std::uint8_t> buf(static_cast<std::size_t>(view.k.bytes()), 0);
-                    CUDA_CHECK(cudaMemcpy(buf.data(), view.k.data, view.k.bytes(),
-                                          cudaMemcpyDeviceToHost));
-                    std::uint64_t h = 1469598103934665603ULL;
-                    for (std::uint8_t b : buf) { h = (h ^ b) * 1099511628211ULL; }
-                    std::fprintf(stderr, "[dbg] ctxKV#%d hash=%016llx nonce=%s\n", dbg_ctx,
-                                 static_cast<unsigned long long>(h),
-                                 std::getenv("NINFER_DBG_NOCTX") ? "zeroed" : "normal");
-                    if (std::getenv("NINFER_DBG_NOCTX") != nullptr) {
-                        for (std::uint32_t layer = 0; layer < DFlashConfig::local_layers; ++layer) {
-                            const auto& v = dflash_state(state).local_layer(layer);
-                            CUDA_CHECK(cudaMemset(v.k.data, 0, v.k.bytes()));
-                            CUDA_CHECK(cudaMemset(v.v.data, 0, v.v.bytes()));
-                        }
-                    }
-                }
-            }
         } else {
             for (int layer = 0; layer < Config::layers; ++layer) {
                 auto layer_scope = state.execution.work.scope();
@@ -295,9 +271,48 @@ void dflash2_select_candidates(DFlashBatchContext& state, qwen3_6::DFlashDecodeS
                          work, stream);
     } else {
         const auto& head = *state.execution.model.optimized_proposal;
-        ops::linear_topk(hidden, head.head, head.token_ids, ids_flat, scores, work, stream);
+        // 优化头在 tp2 下是同一张逻辑表的行分片（每卡 65536 行），而 `draft_head_token_ids` 是
+        // **复制**的整表：本卡第 i 行取 row_to_global_ids[map_row_base + i]，输出即全局 token id。
+        // rank 0 的 map_row_base = 0（与单卡逐位一致）。
+        ops::linear_topk(hidden, head.head, head.token_ids, 0, ids_flat, scores, work, stream);
     }
-    if (tp && state.execution.proposal_head == ProposalHead::Full) {
+    if (tp && state.execution.proposal_head != ProposalHead::Full) {
+        // rank 1 那半张头走同一条逻辑表，map_row_base 取 rank 0 的片宽（= 本卡头片的全局行起点）。
+        // 与 W8 整词表那路相反：那一路 `linear_topk` 返回的是卡内行号，所以合并要补 shard_rows；
+        // 优化头这一路映射在核内完成，两卡出来的都是全局 token id，合并偏移必须给 0，否则会
+        // 把已经全局化的 id 再加一次偏移，候选全部指错 token。
+        const auto& head      = *state.execution.model.optimized_proposal;
+        const auto& peer_head = *tp->weights->optimized_proposal;
+        CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), stream));
+        CUDA_CHECK(cudaSetDevice(tp->device->device));
+        CUDA_CHECK(cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
+        Tensor peer_ids    = tp->work->alloc(DType::I32, {16, mask_columns});
+        Tensor peer_scores = tp->work->alloc(DType::FP32, {16, mask_columns});
+        Tensor peer_hidden_owned;
+        Tensor peer_input = {};
+        if (peer_hidden != nullptr) {
+            peer_input = *peer_hidden;
+        } else {
+            peer_hidden_owned = tp->work->alloc(DType::BF16, {TextConfig::hidden, mask_columns});
+            CUDA_CHECK(cudaMemcpyAsync(peer_hidden_owned.data, hidden.data, peer_hidden_owned.bytes(),
+                                       cudaMemcpyDeviceToDevice, tp->device->stream));
+            peer_input = peer_hidden_owned;
+        }
+        auto peer_scope = tp->work->scope();
+        ops::linear_topk(peer_input, peer_head.head, peer_head.token_ids, head.head.n, peer_ids,
+                         peer_scores, *tp->work, tp->device->stream);
+        CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(1), tp->device->stream));
+        CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, tp->events->inputs_ready(1), 0));
+        Tensor remote_ids    = work.alloc(DType::I32, {16, mask_columns});
+        Tensor remote_scores = work.alloc(DType::FP32, {16, mask_columns});
+        CUDA_CHECK(cudaMemcpyAsync(remote_ids.data, peer_ids.data, remote_ids.bytes(),
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(remote_scores.data, peer_scores.data, remote_scores.bytes(),
+                                   cudaMemcpyDeviceToDevice, stream));
+        ops::topk_pair_merge(ids_flat, scores, remote_ids, remote_scores, ids_flat, scores, 0,
+                             stream);
+    } else if (tp && state.execution.proposal_head == ProposalHead::Full) {
         const auto peer_valid = full_valid - local_valid;
         if (peer_valid > 0) {
             // 跨卡这段是手工排的，没有集合通信帮忙排序，必须自己用事件把两条流串起来，
@@ -808,6 +823,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 throw std::logic_error("tensor-parallel DFlash2 decode requires a peer frame");
             }
             qwen3_6::DFlashDecodeState& peer_frame = *tp->io->dflash_decode;
+            // 草稿是 rank 0 的选择器写在 rank 0 显存上的：必须先把 rank 0 流上到此为止的工作
+            // （选择器写 frame.draft_tokens）与本卡的 D2D 拷贝/验证排好序，否则 rank 1 的拷贝可能
+            // 读到上一轮的草稿 —— 实测症状是两卡 verify_ids 的草稿完全不同（`[vid]` 同 frontier
+            // 两组不同草稿），rank 1 按另一批草稿裁决 ⇒ 两卡 KV 逐轮发散 ⇒ 下一轮 p̃ 来自错状态
+            // ⇒ 采样输出丢 token（HTML 缺 `-scale` / 缺 `=`）。事件用法与 dflash2_select_candidates
+            // 的 peer 路径一致（先 record 再 wait，复用 inputs_ready 这一对事件）。
+            CUDA_CHECK(cudaEventRecord(tp->events->inputs_ready(0), state.execution.device.stream));
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            CUDA_CHECK(cudaStreamWaitEvent(tp->device->stream, tp->events->inputs_ready(0), 0));
             // rank 1 用同一份 ingress 记录（DFlash2 的验证默认 greedy，不读 token_counts 指针）
             CUDA_CHECK(cudaSetDevice(tp->device->device));
             CUDA_CHECK(cudaMemcpyAsync(peer_frame.ingress.data, &state.host_ingress,

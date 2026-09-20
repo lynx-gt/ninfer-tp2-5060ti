@@ -67,7 +67,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales,
     const std::int32_t* __restrict__ row_to_global_ids, std::uint64_t* __restrict__ partial_keys,
-    std::int32_t producer_groups, std::int32_t columns) {
+    std::int32_t producer_groups, std::int32_t columns, std::int32_t map_row_base) {
     constexpr int kKTiles       = kLinearTopKHidden / kBlockK;
     constexpr int kBlockRows    = 64;
     constexpr int kSortItems    = 2;
@@ -258,7 +258,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
             const int row       = row_begin + local_row;
             if (row < kLinearTopKOptimizedRows)
                 keys[item] = score_id_order_key(reusable.reduction.scores[column][local_row],
-                                                row_to_global_ids[row]);
+                                                row_to_global_ids[map_row_base + row]);
         }
         M64WarpSort(reusable.reduction.sort[reducer_warp]).Sort(keys, ScoreIdOrderGreater{});
 #pragma unroll
@@ -281,7 +281,8 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
 
 template <int TileColumns, int kBlockK = 128>
 void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
-                 const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+                 std::int32_t map_row_base, const LinearTopKWorkspace& workspace,
+                 cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(Q4M64ReusableStorage<TileColumns, kBlockK>);
     if constexpr (shared_bytes > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(q4_m64_linear_topk_kernel<TileColumns, kBlockK>,
@@ -295,32 +296,40 @@ void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_
             static_cast<const std::uint8_t*>(head.scales),
             static_cast<const std::int32_t*>(row_to_global_ids.data),
             static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups,
-            hidden.ne[1]);
+            hidden.ne[1], map_row_base);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void linear_topk_q4_m64_launch(const Tensor& hidden, const Weight& head,
-                               const Tensor& row_to_global_ids,
+                               const Tensor& row_to_global_ids, std::int32_t map_row_base,
                                const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     switch (workspace.tile_columns) {
     case 32:
-        return launch_tile<32, 128>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<32, 128>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 48:
-        return launch_tile<48, 128>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<48, 128>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 64:
-        return launch_tile<64, 128>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<64, 128>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 80:
-        return launch_tile<80, 128>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<80, 128>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 112:
-        return launch_tile<112, 64>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<112, 64>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 96:
-        return launch_tile<96, 128>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<96, 128>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 120:
-        return launch_tile<120, 64>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<120, 64>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     case 128:
-        return launch_tile<128, 64>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<128, 64>(hidden, head, row_to_global_ids, map_row_base, workspace,
+                                    stream);
     }
     throw std::invalid_argument("invalid linear_topk MMA tile");
 }
