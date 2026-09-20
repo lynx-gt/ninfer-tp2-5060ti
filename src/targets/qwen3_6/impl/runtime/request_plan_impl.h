@@ -192,14 +192,31 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
+        // DFlash2 的草稿 context 只随 decode 批的提交推进：非 EOS 收尾的请求（tool_calls /
+        // output_limit）会在执行边界前留下最多 width 个 token 的**物理**缺口（context 内容只
+        // 追加到最后一轮的 base_E）。追加边界必须对齐到草稿 context 的真实末尾；缺口里那几个
+        // token 由随后的后缀 prefill 重算并补喂进草稿 context —— 复用保留，代价只是重算 ≤width
+        // 个 token。缺口超过 width 说明状态已越出 decode 不变式，不走这条路（落到检查点或全量）。
+        const std::uint32_t dflash_lag =
+            speculative_backend == SpeculativeBackend::DFlash2 &&
+                    sequence.dflash_context_frontier <= sequence.execution_frontier
+                ? sequence.execution_frontier - sequence.dflash_context_frontier
+                : 0U;
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
         if (sequence.execution_frontier != 0 && dflash_append_ready &&
+            dflash_lag <= draft_window + 1U &&
             qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                             sequence.execution_frontier)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = sequence.execution_frontier;
+            plan->reuse_base = sequence.execution_frontier - dflash_lag;
+            if (dflash_lag != 0U) {
+                std::fprintf(stderr,
+                             "[info] dflash2 append frontier aligned: execution=%u dflash=%u lag=%u\n",
+                             sequence.execution_frontier, sequence.dflash_context_frontier,
+                             dflash_lag);
+            }
         } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
                    sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                    qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
@@ -284,38 +301,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
     }
 
-    // A resumed prefill has to reproduce the chunk decomposition a full prefill would use, or the
-    // two paths land on different floating-point accumulations -- and greedy decoding turns a last
-    // bit into different text. The boundary that matters is the prefill chunk grid: a full prefill
-    // lays chunks down from 0, so the chunk it computes last starts at a multiple of the chunk
-    // width. Resuming mid-chunk computes the same tokens from a different start, which is a
-    // different decomposition (measured: the same request resumed at a non-grid frontier and
-    // re-prefilled diverge on the first generated token). Retreating to the grid costs at most
-    // `prefill_chunk - 1` recomputed tokens -- negligible against the prefix retained -- and makes
-    // the resumed suffix the very chunk a full prefill would have computed. A retreat to zero means
-    // nothing is left to reuse.
-    //
-    // It applies to the resident-prefix path (`AppendAtFrontier`) only. A rewrite-checkpoint
-    // restore carries a *state snapshot* -- the recurrent GDN slots plus the retained tail hidden --
-    // that lives at the checkpoint frontier, and the restore path installs it verbatim
-    // (`trim_sequence_kv` + `copy_slot` truncate the KV to the reuse base before the suffix runs).
-    // Retreating the base away from that frontier would therefore keep the frontier's recurrent
+    // A rewrite-checkpoint restore carries a *state snapshot* -- the recurrent GDN slots plus the
+    // retained tail hidden -- that lives at the checkpoint frontier, and the restore path installs
+    // it verbatim (`trim_sequence_kv` + `copy_slot` truncate the KV to the reuse base before the
+    // suffix runs). Moving the base away from that frontier would keep the frontier's recurrent
     // state while re-running the tokens in between, i.e. double-count them, which is why the
-    // execution guard demands `checkpoint.frontier == reuse_base`. Leaving the base where the
-    // checkpoint is keeps reuse working; the numeric grid argument is instead satisfied by
-    // retreating the *capture* side (see below) so both sides name the same boundary.
-    if (plan->reuse != ReusePath::FullReset && plan->reuse_base != 0 && prefill_chunk > 0 &&
-        !is_rewrite_checkpoint_restore(plan->reuse)) {
-        const std::uint32_t aligned = plan->reuse_base - plan->reuse_base % prefill_chunk;
-        if (aligned == 0) {
-            plan->reuse      = ReusePath::FullReset;
-            plan->reuse_base = 0;
-        } else {
-            plan->reuse_base = aligned;
-        }
-    }
+    // execution guard demands `checkpoint.frontier == reuse_base`.
     // The checkpoint decisions above may have selected an action that requires a live reuse, while
-    // the alignment just downgraded the plan to a full reset. Keep the two consistent: a dropped
+    // a downgrade can still turn the plan into a full reset. Keep the two consistent: a dropped
     // reuse cannot retain or reclassify a checkpoint. (Ignoring this is what made a repeated prompt
     // throw from plan validation -- and an exception at that point takes the whole executor down.)
     if (plan->reuse == ReusePath::FullReset) {
