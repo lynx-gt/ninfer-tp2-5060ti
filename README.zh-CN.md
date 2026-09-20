@@ -31,18 +31,18 @@ OpenAI / Anthropic 兼容的 HTTP 接口处理文本、图像与视频输入；�
 本 fork 跑的是 **Qwen3.8-27B NVFP4** 的两种可互换形态。两者都在这里于 **2× RTX 5060 Ti** 上以 `--tp 2`
 实测过；两者都装不进单块 16 GiB 卡。
 
-| | 官方版（上游的） | 本 fork 的 W4A4 |
+| | 官方版（上游的） | QUASAR W4A4 |
 |---|---|---|
-| 产物 | [`qwen3_8_27b_nvfp4.ninfer`](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_nvfp4w4a4.ninfer`，见下方转换 |
-| 体积 | 21,492,695,040 B（20.02 GiB） | 17,555,334,916 B（16.35 GiB） |
-| `--tp 2` 下每卡权重 | 10.08 GiB | 8.66 GiB |
-| 量化 | MLP 走 NVFP4，其余走行标度 FP8 | 全程 NVFP4，含 4 bit 激活 |
-| `int8` KV + MTP3 下的 decode | 76–86 tok/s | 106.5 tok/s |
-| `int8` KV 下的单槽 | 262144（该产物的原生上限） | 262144 |
-| SHA-256 | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` | `63c204d223e73d63d6d4db8a82aa3f4859592cd83b00545bcee38334643341cb` |
+| 产物 | [`qwen3_8_27b_nvfp4.ninfer`](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_quasar_w4a4.ninfer`，重打包见下 |
+| 体积 | 21,492,695,040 B（20.02 GiB） | 19,782,140,416 B（18.42 GiB） |
+| `--tp 2` 下每卡权重 | 10.08 GiB | 9.87 GiB |
+| 量化 | MLP 走 NVFP4，其余走行标度 FP8 | 全程 NVFP4，含 4 bit 激活（QUASAR QAT）；DFlash2、MTP、视觉已内置 |
+| `int8` KV 下的 decode | 76–86 tok/s（MTP3） | 107.1 tok/s（MTP3）、126.3 tok/s（dflash2 K7） |
+| `int8` KV 下的单槽 | 262144（该产物的原生上限） | 253952 实测（原生上限 262144） |
+| SHA-256 | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` | `78607ff1f9bfb087a5cd85c8bc72d317e6edefc7e79bdde6e43f1ce21336f898` |
 
-官方版一次下载、无需转换；W4A4 版每卡权重少 16%、同一 KV 档下 decode 快约 24%。本 README 其余内容对两者
-同样适用 —— 唯一区别是命令行上写的产物路径。
+官方版一次下载、无需转换；QUASAR W4A4 版只需一步无损重打包，同一 KV 档下 decode 快 25–47%。
+本 README 其余内容对两者同样适用 —— 唯一区别是命令行上写的产物路径。
 
 拿官方版：
 
@@ -52,65 +52,36 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir models
 ```
 
-### W4A4 的源
+### QUASAR W4A4 产物
 
-`.ninfer` 产物不由本仓分发 —— 用仓内转换器从公开的源权重自行构建。
+W4A4 形态就是对已发布的 QUASAR 产物做一次重打包 —— 不涉及任何量化或格式转换。
 
 | 项 | 值 |
 |---|---|
-| 源（Hugging Face） | [`nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4`](https://huggingface.co/nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4/tree/main/W4A4) 的 `W4A4/` 子目录（ModelOpt NVFP4，group size 16，`variant = fast`） |
-| 源文件 | `model-nvfp4-fast.safetensors`（18,822,252,240 B，SHA-256 `9b7e1c4d839995ee9ed35ac682ecf31e81ae4bc6ddb4e3aaa7f585b786bb83a0`）与 `vision-mtp-bf16.safetensors`（1,770,897,648 B），加索引和 6 个前端资源 |
-| 源校验 | 目录里的 `SHA256SUMS`；`manifest.json` 的 `source_package_sha256 = 2d2eac20ceb1439ab85eda4c5d616150f1c1f4956729333cc6e6e15e49739b21` |
-| 转换器 | [`tools/convert/qwen3_8_27b/convert_w4a4.py`](tools/convert/qwen3_8_27b/convert_w4a4.py) |
-| 结果 | `qwen3_8_27b_nvfp4w4a4.ninfer`，17,555,334,916 B（16.35 GiB），SHA-256 `63c204d223e73d63d6d4db8a82aa3f4859592cd83b00545bcee38334643341cb` |
-
-### 产物是怎么转出来的
+| 源（Hugging Face） | [`MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer`](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer) —— 从 QUASAR QAT checkpoint 构建的原生 `.ninfer` 产物，DFlash2、MTP、视觉已内置 |
+| 源文件 | `qwen3_8_27b_nvfp4.ninfer`，19,782,132,224 B，SHA-256 `da5efb3332e00ed5a9d719aa5cc09a4066fa03ab0d1706f6119f2fba8f2ba338` |
+| 重打包 | [`tools/convert/qwen3_8_27b/repack_quasar.py`](tools/convert/qwen3_8_27b/repack_quasar.py)（只用 Python 标准库） |
+| 结果 | `qwen3_8_27b_quasar_w4a4.ninfer`，19,782,140,416 B（18.42 GiB），SHA-256 `78607ff1f9bfb087a5cd85c8bc72d317e6edefc7e79bdde6e43f1ce21336f898` |
 
 ```bash
-# 1. 取公开 checkpoint 的 W4A4 子目录
-hf download nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4 \
-  --include "W4A4/*" --local-dir src
+# 1. 下载 QUASAR 产物
+hf download MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer --local-dir src/quasar
 
-# 2. 转换
-python3 -m tools.convert.qwen3_8_27b.convert_w4a4 \
-  --src src/W4A4 --out models/qwen3_8_27b_nvfp4w4a4.ninfer
-
-# 3. 校验：重算每个对象，与产物逐字节比对
-python3 -m tools.convert.qwen3_8_27b.convert_w4a4 \
-  --src src/W4A4 --verify models/qwen3_8_27b_nvfp4w4a4.ninfer
+# 2. 重打包到本 fork 的 W4A4 契约（无损，约一分钟）
+python3 -m tools.convert.qwen3_8_27b.repack_quasar \
+  --src src/quasar/qwen3_8_27b_nvfp4.ninfer \
+  --out models/qwen3_8_27b_quasar_w4a4.ninfer
 ```
 
+为什么需要这一步重打包：QUASAR 产物声明的 `identity.weights_id = nvfp4`，其注册契约与它的端点
+描述符对不上；并且它把 48 个 GDN 投影存成融合的 `gdn/a_b_projection`，而 W4A4 档绑定的是分开的
+`a_projection` / `b_projection` 两个对象。所以重打包只改写容器头：每个融合父张量变成指向同一段
+载荷前/后半的两个目录视图，identity 翻成 `nvfp4-w4a4`。**载荷一个字节都不动** —— 不复制、不重新
+量化、只用标准库。仓内这版重打包从公开源跑出来的文件与上面的 SHA-256 **逐字节相同**。
+
 `huggingface.co` 在部分网络下不可达。`huggingface_hub` 认 `HF_ENDPOINT` 环境变量，所以
-`HF_ENDPOINT=https://hf-mirror.com hf download …` 可以经镜像取到同样的文件 —— 本 fork 最近一次复现这三步时
-就是这么下的。
-
-转换器从 `src/W4A4` 读 **9 个文件**：两个 safetensors 分片、`model.safetensors.index.json`，以及 6 个前端资源
-（`tokenizer.json`、`tokenizer_config.json`、`chat_template.jinja`、`generation_config.json`、
-`preprocessor_config.json`、`video_preprocessor_config.json`）。那 6 个会被**逐字节**写进产物，缺任何一个
-转换立即中止 —— 所以上面 `W4A4/*` 这条 glob 正是该下的：它把转换器需要的全拉下来，除两个分片外只多约 13 MB。
-
-转换器做了什么、以及刻意不做什么：
-
-- **复用引擎自己的编码器**：NVFP4 对象**逐字节重打包**，BF16/FP32 对象直通，W8/Q4/Q5/Q6 端点、MTP 模块与
-  视觉塔都过引擎加载时用的同一个编码器重新量化；
-- **融合投影按张量并行分片期望的物理行序输出**：`attention/query_key_gate_value` 为 `[Q | K | Gate | V]`
-  （query 与 gate 按 head 从 `q_proj` 里取，每 head 256 + 256 行）、`mlp/gate_up` 为 `[gate | up]`、
-  `gdn/query_key_value_z` 为 `[qkv | z]`；
-- **`gdn/convolution` 是转置而不是 reshape**：源里存成 `(C, 1, K)`，引擎按 `[K, C]` 读；直接 reshape 会
-  保留扁平顺序、静默搞坏全部 GDN 层；
-- **九层例外层保持 NVFP4**（Qwen3.6 的 NVFP4 recipe 会把它们留成 BF16）：源本来就是 NVFP4，转换器保留源、
-  不降精度；
-- **优化草稿头是算出来的**：它由一份频率 ranking 导出（`--draft-ranking`，默认
-  `tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64`）。ranking 里每个 token 的值是"模型自己在
-  72k 段对话上 teacher-forced argmax 出它的次数"；转换器取频率最高的 **131,072 个** token（全词表 248,320）
-  加上全部 special token，把 output head 里对应的行切出来构成 `text/draft_head`，id 列表写成
-  `text/draft_head_token_ids`。它是算出来的、不是从源里搬的，换一份语料就会得到不同的草稿头。
-  **算法和语料都是上游的**：选取与物化在 `tools/convert/qwen3_6/common/draft_head.py`，ranking fixtures
-  随上游仓一起分发在 `tools/freq_corpus/`；这一档只是把它们接到 W4A4 的源上。
-
-校验门槛是逐字节比对，本 fork 的产物在 **1310 个张量对象 + 6 个前端资源**上全部通过。上面这三步在本 fork
-的机器上从公开源**重跑过一遍**，产出的文件与随本 fork 发布的产物**逐字节相同**（SHA-256 见上表）。完整页面见
-[docs/maintainer/qwen3.8-27b-w4a4-artifact.md](docs/maintainer/qwen3.8-27b-w4a4-artifact.md)。
+`HF_ENDPOINT=https://hf-mirror.com hf download …` 可以经镜像取到同样的文件。
 
 ### 引擎还注册了哪些产物
 
@@ -138,27 +109,26 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-在双卡上以 K16V8 KV cache 起 27B 的 NVFP4 W4A4 产物（253,952 token 单槽，MTP3 投机解码 + 优化草稿头）。
-W4A4 那份要先按[权重](#权重)转出来放进 `models/`；要用官方版就把这里的路径换掉（它用 `int8` KV 时能吃满
+在双卡上起 QUASAR W4A4 产物（253,952 token 单槽，DFlash2 K7 投机解码 + 优化草稿头）。
+W4A4 那份要先按[权重](#权重)重打包放进 `models/`；要用官方版就把这里的路径换掉（它用 `int8` KV 时能吃满
 262,144 token 的单槽）：
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4w4a4.ninfer \
-  --host 0.0.0.0 --port 8815 --model-id qwen3.8-27b-w4a4-mtp3 \
-  --tp 2 --devices 0,1 --kv-dtype k16i8 \
+./build/apps/ninfer-serve models/qwen3_8_27b_quasar_w4a4.ninfer \
+  --host 0.0.0.0 --port 8815 --model-id qwen3.8-27b-quasar-w4a4 \
+  --tp 2 --devices 0,1 --kv-dtype int8 \
   --max-context 253952 --kv-capacity 253952 --prefill-chunk 1024 \
-  --spec mtp --draft-tokens 3 --lm-head-draft --max-concurrency 1 --cors
+  --spec dflash2 --draft-tokens 7 --lm-head-draft --max-concurrency 1 --cors
 ```
 
-环境要求见 [构建要求](#构建要求)，产物转换见
-[`docs/maintainer/qwen3.8-27b-w4a4-artifact.md`](docs/maintainer/qwen3.8-27b-w4a4-artifact.md)。
+环境要求见 [构建要求](#构建要求)，产物重打包见 [权重](#权重)。
 
 ## 用法
 
 **CLI**（双卡单次提问）：
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4w4a4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_quasar_w4a4.ninfer \
   --tp 2 --devices 0,1 \
   --kv-dtype k16i8 --max-context 32768 --kv-capacity 32768 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
@@ -263,7 +233,7 @@ usage 里：OpenAI 侧是 `usage.prompt_tokens_details.cached_tokens`，Anthropi
 **能力评测：本 fork 没有预算去跑 benchmark**，所以这里不列任何分数。想看分数去模型仓库 —— 各产物的
 model card（`model-cards/`）以及它们在 Hugging Face 上的页面里有上游的成绩（AIME 2025/2026、
 GPQA-Diamond、ERQA、RealWorldQA，EvalScope 1.9.0、单样本）。注意那些是在**上游的产物**上测的，
-不是本 fork 转换出来的这一份。
+不是本 fork 重打包的这一份。
 
 ## 构建要求
 
@@ -362,7 +332,7 @@ Issues 是开着的。
 - [CLI](docs/cli.md)
 - [HTTP 服务](docs/serving.md)
 - [性能](docs/performance.md)
-- [Qwen3.8-27B W4A4 产物（本 fork 验证用的形态）](docs/maintainer/qwen3.8-27b-w4a4-artifact.md)
+- [Qwen3.8-27B W4A4 产物（本 fork 的 Merkyor 转换线，历史形态）](docs/maintainer/qwen3.8-27b-w4a4-artifact.md)
 - [双卡 TP2 执行与 YaRN 1M 上下文](docs/maintainer/tp2-yarn-1m.md)
 - [CLI 示例](examples/cli/)
 

@@ -34,19 +34,19 @@ measures is in the fork note.
 This fork runs **Qwen3.8-27B NVFP4** in two interchangeable forms. Both were measured here at
 `--tp 2` on 2× RTX 5060 Ti; neither fits on a single 16 GiB card.
 
-| | official — upstream's | this fork's W4A4 |
+| | official — upstream's | QUASAR W4A4 |
 |---|---|---|
-| artifact | [`qwen3_8_27b_nvfp4.ninfer`](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_nvfp4w4a4.ninfer`, converted below |
-| size | 21,492,695,040 B (20.02 GiB) | 17,555,334,916 B (16.35 GiB) |
-| weights per card at `--tp 2` | 10.08 GiB | 8.66 GiB |
-| quantization | NVFP4 MLP plus row-scaled FP8 elsewhere | NVFP4 throughout, including 4-bit activations |
-| decode at `int8` KV, MTP3 | 76–86 tok/s | 106.5 tok/s |
-| single slot at `int8` KV | 262144 (that artifact's native ceiling) | 262144 |
-| SHA-256 | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` | `63c204d223e73d63d6d4db8a82aa3f4859592cd83b00545bcee38334643341cb` |
+| artifact | [`qwen3_8_27b_nvfp4.ninfer`](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_quasar_w4a4.ninfer`, repacked below |
+| size | 21,492,695,040 B (20.02 GiB) | 19,782,140,416 B (18.42 GiB) |
+| weights per card at `--tp 2` | 10.08 GiB | 9.87 GiB |
+| quantization | NVFP4 MLP plus row-scaled FP8 elsewhere | NVFP4 throughout, including 4-bit activations (QUASAR QAT); DFlash2, MTP and Vision already inside |
+| decode at `int8` KV | 76–86 tok/s (MTP3) | 107.1 tok/s (MTP3), 126.3 tok/s (dflash2 K7) |
+| single slot at `int8` KV | 262144 (that artifact's native ceiling) | 253952 measured (262144 native ceiling) |
+| SHA-256 | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` | `78607ff1f9bfb087a5cd85c8bc72d317e6edefc7e79bdde6e43f1ce21336f898` |
 
-The official form is one download with nothing to convert; the W4A4 form carries 16% less weight per
-card and decodes about 24% faster on the same KV tier. Everything else in this README applies to both
-— the only difference is the artifact path on the command line.
+The official form is one download with nothing to convert; the QUASAR W4A4 form needs one lossless
+repack step and decodes 25–47% faster on the same KV tier. Everything else in this README applies to
+both — the only difference is the artifact path on the command line.
 
 Get the official artifact:
 
@@ -56,74 +56,40 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir models
 ```
 
-### The W4A4 source
+### The QUASAR W4A4 artifact
 
-The `.ninfer` artifact is not distributed here; build it from the published source with the in-tree
-converter.
+The W4A4 form is a repack of the published QUASAR artifact — no quantization or format conversion
+is involved.
 
 | | |
 |---|---|
-| Source | [`nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4`](https://huggingface.co/nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4/tree/main/W4A4), subdirectory `W4A4` — ModelOpt NVFP4, group size 16, `variant = fast` |
-| Source files | `model-nvfp4-fast.safetensors` (18,822,252,240 B, SHA-256 `9b7e1c4d839995ee9ed35ac682ecf31e81ae4bc6ddb4e3aaa7f585b786bb83a0`) and `vision-mtp-bf16.safetensors` (1,770,897,648 B), plus the index and six frontend resources |
-| Source check | the directory's `SHA256SUMS`, and `manifest.json` with `source_package_sha256 = 2d2eac20ceb1439ab85eda4c5d616150f1c1f4956729333cc6e6e15e49739b21` |
-| Converter | [`tools/convert/qwen3_8_27b/convert_w4a4.py`](tools/convert/qwen3_8_27b/convert_w4a4.py) |
-| Result | `qwen3_8_27b_nvfp4w4a4.ninfer`, 17,555,334,916 bytes (16.35 GiB), SHA-256 `63c204d223e73d63d6d4db8a82aa3f4859592cd83b00545bcee38334643341cb` |
-
-### How the W4A4 artifact is built
+| Source | [`MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer`](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer) — a native `.ninfer` artifact built from the QUASAR QAT checkpoint, with DFlash2, MTP and Vision already inside |
+| Source file | `qwen3_8_27b_nvfp4.ninfer`, 19,782,132,224 B, SHA-256 `da5efb3332e00ed5a9d719aa5cc09a4066fa03ab0d1706f6119f2fba8f2ba338` |
+| Repack | [`tools/convert/qwen3_8_27b/repack_quasar.py`](tools/convert/qwen3_8_27b/repack_quasar.py) (Python standard library only) |
+| Result | `qwen3_8_27b_quasar_w4a4.ninfer`, 19,782,140,416 B (18.42 GiB), SHA-256 `78607ff1f9bfb087a5cd85c8bc72d317e6edefc7e79bdde6e43f1ce21336f898` |
 
 ```bash
-# 1. the W4A4 subdirectory of the published checkpoint
-hf download nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4 \
-  --include "W4A4/*" --local-dir src
+# 1. download the QUASAR artifact
+hf download MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer --local-dir src/quasar
 
-# 2. convert
-python3 -m tools.convert.qwen3_8_27b.convert_w4a4 \
-  --src src/W4A4 --out models/qwen3_8_27b_nvfp4w4a4.ninfer
-
-# 3. verify: recompute every object and byte-compare it against the artifact
-python3 -m tools.convert.qwen3_8_27b.convert_w4a4 \
-  --src src/W4A4 --verify models/qwen3_8_27b_nvfp4w4a4.ninfer
+# 2. repack it onto this fork's W4A4 contract (lossless, about a minute)
+python3 -m tools.convert.qwen3_8_27b.repack_quasar \
+  --src src/quasar/qwen3_8_27b_nvfp4.ninfer \
+  --out models/qwen3_8_27b_quasar_w4a4.ninfer
 ```
+
+Why the repack exists: the QUASAR artifact declares `identity.weights_id = nvfp4`, whose registered
+contract does not match its endpoint descriptors, and it keeps the 48 GDN projections fused as
+`gdn/a_b_projection` where the W4A4 tier binds separate `a_projection` / `b_projection` objects. The
+repack therefore rewrites the container header only: each fused GDN parent becomes two directory
+views over the same payload halves, and the identity flips to `nvfp4-w4a4`. **No payload byte is
+touched** — no copy, no requantization, standard library only. Run from the published source, the
+in-tree repack produces a file byte-identical to the SHA-256 above.
 
 `huggingface.co` is not reachable from every network. `huggingface_hub` honours the `HF_ENDPOINT`
 environment variable, so `HF_ENDPOINT=https://hf-mirror.com hf download …` fetches the same files
-through a mirror — that is how these steps were run when this fork's conversion was last reproduced.
-
-The converter reads nine files from `src/W4A4`: the two safetensors shards, `model.safetensors.index.json`,
-and six frontend resources (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
-`generation_config.json`, `preprocessor_config.json`, `video_preprocessor_config.json`). The six
-frontend resources are copied into the artifact byte-for-byte and the conversion aborts if any is
-missing, so the `W4A4/*` glob above is the right thing to download — it fetches everything the
-converter needs, at roughly 13 MB beyond the two shards.
-
-What the converter does, and what it deliberately does not do:
-
-- it reuses the engine's own encoders. NVFP4 objects are **repacked byte-exactly**, BF16/FP32 objects
-  pass through, and the W8/Q4/Q5/Q6 endpoint, the MTP module and the vision tower are re-quantized
-  through the same encoder the engine loads with;
-- it emits the fused projections in the physical row order the tensor-parallel shards expect:
-  `attention/query_key_gate_value` as `[Q | K | Gate | V]` (query and gate taken per head from
-  `q_proj`, 256 + 256 rows per head), `mlp/gate_up` as `[gate | up]`, and `gdn/query_key_value_z` as
-  `[qkv | z]`;
-- it **transposes** `gdn/convolution`: the source stores it `(C, 1, K)` and the engine reads
-  `[K, C]`, so a plain reshape would keep the flat order and silently corrupt all GDN layers;
-- it keeps nine layers as NVFP4 that the Qwen3.6 NVFP4 recipe leaves in BF16. The source already
-  stores them as NVFP4, so the converter preserves the source instead of down-converting it;
-- it builds the optimized proposal head from a frequency ranking (`--draft-ranking`, default
-  `tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64`). The ranking holds, per token, how
-  often the model's own teacher-forced argmax emitted it over a 72k-conversation corpus; the
-  converter takes the top 131,072 tokens (of 248,320) plus every special token, slices those rows out
-  of the output head into `text/draft_head`, and writes their ids as `text/draft_head_token_ids`. The
-  head is computed, not copied out of the source, so a different corpus yields a different head.
-  Both the algorithm and the corpus are **upstream's**: the selection and materialization live in
-  `tools/convert/qwen3_6/common/draft_head.py`, and the ranking fixtures ship in `tools/freq_corpus/`
-  with upstream's tree. This tier only wires them to the W4A4 source.
-
-The verification gate is a byte comparison, and the conversion this fork ships passes it on **all
-1310 tensor objects plus the six frontend resources**. The three steps above were re-run from the
-published source on this fork's machine and produced a file **byte-identical** to the artifact it
-ships (same SHA-256 as the table above). The full page is
-[docs/maintainer/qwen3.8-27b-w4a4-artifact.md](docs/maintainer/qwen3.8-27b-w4a4-artifact.md).
+through a mirror.
 
 ### Other registered artifacts
 
@@ -155,20 +121,20 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-Serve the W4A4 artifact from [The weights](#the-weights) on two GPUs with the K16V8 KV cache
-(253,952-token single slot, MTP3 speculative decoding with the optimized draft head). To use the
-official artifact instead, swap the path — with `int8` KV it fits a full 262,144-token slot:
+Serve the QUASAR W4A4 artifact from [The weights](#the-weights) on two GPUs (253,952-token single
+slot, DFlash2 K7 speculative decoding with the optimized draft head). To use the official artifact
+instead, swap the path — with `int8` KV it fits a full 262,144-token slot:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4w4a4.ninfer \
-  --host 0.0.0.0 --port 8815 --model-id qwen3.8-27b-w4a4-mtp3 \
-  --tp 2 --devices 0,1 --kv-dtype k16i8 \
+./build/apps/ninfer-serve models/qwen3_8_27b_quasar_w4a4.ninfer \
+  --host 0.0.0.0 --port 8815 --model-id qwen3.8-27b-quasar-w4a4 \
+  --tp 2 --devices 0,1 --kv-dtype int8 \
   --max-context 253952 --kv-capacity 253952 --prefill-chunk 1024 \
-  --spec mtp --draft-tokens 3 --lm-head-draft --max-concurrency 1 --cors
+  --spec dflash2 --draft-tokens 7 --lm-head-draft --max-concurrency 1 --cors
 ```
 
 [Requirements](#requirements), [Build](#build) and
-[Dual-GPU (TP2)](#dual-gpu-tp2) cover the prerequisites, artifact conversion and the complete option
+[Dual-GPU (TP2)](#dual-gpu-tp2) cover the prerequisites, the artifact repack and the complete option
 set.
 
 ## Performance
@@ -188,7 +154,7 @@ This fork has no budget for a capability evaluation of its own, so no benchmark 
 here. For scores, see the model repositories: the per-artifact model cards under
 [`model-cards/`](model-cards/) and the artifacts' Hugging Face pages carry upstream's results
 (AIME 2025/2026, GPQA-Diamond, ERQA, RealWorldQA, EvalScope 1.9.0, single sample). Those were
-measured on upstream's artifacts, not on this fork's conversion.
+measured on upstream's artifacts, not on this fork's repack.
 
 ## Requirements
 
@@ -302,7 +268,7 @@ W4A4 artifact described under [The weights](#the-weights).
 
 ```bash
 # both GPUs, K16V8 KV, a 253,952-token single slot, MTP3 with the optimized proposal head
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4w4a4.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_quasar_w4a4.ninfer \
   --tp 2 --devices 0,1 \
   --max-context 253952 --kv-capacity 253952 --prefill-chunk 1024 \
   --kv-dtype k16i8 \
@@ -315,7 +281,7 @@ answer channel, because at this checkpoint's default thinking mode a 16-token bu
 entirely inside the reasoning stream:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4w4a4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_quasar_w4a4.ninfer \
   --tp 2 --devices 0,1 \
   --max-context 253952 --kv-capacity 253952 --kv-dtype k16i8 \
   --messages long_prompt.json --max-new 256 --no-thinking
