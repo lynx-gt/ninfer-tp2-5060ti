@@ -86,6 +86,9 @@ struct SequencePlanningInputs {
     // `yarn_origin * yarn_factor` under Yarn.
     std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
+    // 视觉 merged-token 预算（见 EngineOptions::vision_max_merged_tokens）：决定 vision_encode
+    // 工作区档位与请求 transient 的冻结容量。
+    std::uint32_t vision_max_merged_tokens = 4096;
     int device          = 0;
     // Tensor-parallel width. Every per-device geometry below (KV heads, GDN value heads, GDN conv
     // channels) is the model's own extent divided by `tp`, because each device holds only its own
@@ -125,6 +128,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t yarn_origin           = 0;
     std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
+    std::uint32_t vision_max_merged_tokens = 4096;
     int device          = 0;
     int tp              = 1;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;

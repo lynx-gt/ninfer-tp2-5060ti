@@ -676,9 +676,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit  = 32768;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
-        const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
+        // merged 预算来自起动选项（默认 4096，可在 16 GiB 卡上与 int8 262144 共存），不再按
+        // 32768 满额预留。超限的媒体请求在规划期被 workspace 校验拒绝。
+        const std::uint32_t merged = std::min(plan.capacity, plan.vision_max_merged_tokens);
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
             merged, std::min(merged, kFrontendSegmentLimit));
     }
@@ -801,6 +802,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->yarn_origin         = inputs.yarn_origin;
     impl->effective_max_context = inputs.effective_max_context;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
+    impl->vision_max_merged_tokens = inputs.vision_max_merged_tokens;
     impl->device              = inputs.device;
     impl->tp                  = inputs.tp;
     impl->kv_k_dtype          = inputs.kv_k_dtype;
@@ -826,8 +828,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
+        const std::uint32_t merged = std::min(impl->capacity, impl->vision_max_merged_tokens);
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(merged);
     }
@@ -975,6 +976,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // tp 2 captures like tp 1. `--no-cuda-graph` is the escape hatch that runs the same
         // forward pass eagerly (two streams, cross-device event sync) at either width.
         .use_cuda_graph = options.use_cuda_graph,
+        .vision_max_merged_tokens = options.vision_max_merged_tokens,
         .device         = options.device,
         .tp             = options.tp,
     };

@@ -127,6 +127,10 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // 视觉编码工作区/transient 的 merged-token 预算上限（每张图像经 2×2 merge 后的 token 数；
+    // 768×768 ≈ 576）。起动时按它预留视觉 scratch 与输出 transient —— 4096 在 16 GiB 卡上
+    // 与 int8 262144 共存（三者和 < 每卡起动余量）；更大的卡可调大，超限的媒体请求在规划期被拒。
+    std::uint32_t vision_max_merged_tokens   = 4096;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };
