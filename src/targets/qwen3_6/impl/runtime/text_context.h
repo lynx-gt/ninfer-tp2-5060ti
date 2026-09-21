@@ -267,7 +267,13 @@ public:
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+                  std::uint32_t nominal_length, VisionPrefillSession& vision,
+                  VisionPrefillSession* peer_vision, bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+                  std::uint32_t nominal_length, VisionPrefillSession& vision,
+                  VisionPrefillSession* peer_vision, bool finalize_at_end,
+                  DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,
@@ -495,6 +501,8 @@ private:
         std::span<const int> token_ids;
         std::span<const std::int32_t> positions;
         VisionPrefillSession* vision = nullptr;
+        // tp2 下 rank 1 的编码会话（各自编码各自落地）；tp1 为空。
+        VisionPrefillSession* peer_vision = nullptr;
         std::uint32_t begin          = 0;
         std::int32_t rope_delta      = 0;
     };
@@ -518,6 +526,11 @@ private:
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                       const TextPrefill& text_prefill, Tap& tap,
                                                       bool finalize_at_end);
+    // tp2 的多模态 prefill：两卡各自编码（复制 ViT 权重）、各自 scatter，文本层与 prefill_impl_tp2 一致。
+    template <class Tap>
+    [[nodiscard]] PrefillChunkResult
+    prefill_impl_multimodal_tp2(std::span<const int> ids, const MultimodalPrefill& multimodal,
+                                Tap& tap, bool finalize_at_end);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

@@ -751,7 +751,9 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
-        if (options.enable_vision) {
+        if (options.enable_vision && options.speculative.backend == SpeculativeBackend::DFlash) {
+            // v1 保持互斥。DFlash2 放行：prefill sink 喂的是文本层 hidden（媒体位置与普通
+            // token 同构），verify 侧精确；草稿对媒体段用 1 轴 rope 只是接受率近似。
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
         }
         break;
@@ -763,16 +765,11 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         // MTP is split-aware (sharded stem/attention/post-mixer, sharded draft head with an
         // allgather before the proposal argmax, per-device GDN replay records and per-device
         // replay fold). DFlash is NOT: its weights are sharded by the load plan but
-        // its forward path composes plain linear/residual_add over whole-width tensors, and the
-        // Vision encoder runs entirely on device 0. Engine rejects both combinations too (its
-        // guard is the authority for callers that never reach a target); this is the
-        // target-layer statement of the same fact.
+        // its forward path composes plain linear/residual_add over whole-width tensors.
+        // Vision IS supported at tp2 (replicated tower, per-rank encode).
         if (options.speculative.backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument("--tp 2 does not support the DFlash speculative backend "
                                         "in this build; use --tp 1, --spec mtp or --spec none");
-        }
-        if (options.enable_vision) {
-            throw std::invalid_argument("--tp 2 does not support Vision in this build");
         }
     }
     if (device.sm() != 120) {

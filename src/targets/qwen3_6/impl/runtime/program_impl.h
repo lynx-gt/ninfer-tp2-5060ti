@@ -283,9 +283,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
     }
-    if (model.dflash.has_value() && model.vision.has_value()) {
-        throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
-    }
+    // DFlash2 × Vision 放行：草稿 context 只消费文本层 hidden（媒体位置同构），verify 侧精确；
+    // 草稿对媒体段用 1 轴 rope 是接受率近似，不影响输出正确性。v1 的互斥由选项层把关。
     if ((tp == 2) != (peer_model != nullptr) || (tp == 2) != (plan.tp == 2)) {
         throw std::invalid_argument("Qwen3.6 program tensor-parallel width is inconsistent");
     }
@@ -575,7 +574,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
-                                                               runtime::TransientRegion transient) {
+                                                               runtime::TransientRegion transient,
+                                                               runtime::TransientRegion peer_transient) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -792,7 +792,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prompt                     = std::move(prompt),
             .vision_plan                = std::move(request_plan.vision),
             .vision                     = nullptr,
+            .peer_vision                = nullptr,
             .transient                  = transient,
+            .peer_transient             = peer_transient,
             .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
             .base                       = base,
             .cursor                     = base,
@@ -808,6 +810,17 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
                 device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+            if (peer_core) {
+                // tp2：两卡各自建会话、各自编码（replicated 权重 + 各自落地），与
+                // token embedding / dflash tail 的复制计算范式一致——前向零跨卡流量。
+                if (staged.peer_transient.data == nullptr) {
+                    throw std::logic_error(
+                        "tensor-parallel vision prefill requires the rank-1 transient region");
+                }
+                staged.peer_vision = std::make_unique<schedule::VisionPrefillSession>(
+                    *peer_core->device, *peer_core->model, *peer_core->work, staged.prompt,
+                    *staged.vision_plan, staged.peer_transient);
+            }
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
@@ -2227,8 +2240,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
-                    schedule_state, staged.prompt, *staged.vision, nominal,
-                    rewrite_checkpoint_capture_frontier, final_candidate);
+                    schedule_state, staged.prompt, *staged.vision, staged.peer_vision.get(),
+                    nominal, rewrite_checkpoint_capture_frontier, final_candidate);
             } else {
                 result = schedule::prefill_text_chunk(
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,

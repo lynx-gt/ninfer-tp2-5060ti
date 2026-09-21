@@ -1429,18 +1429,43 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end) {
+                                              VisionPrefillSession& vision,
+                                              VisionPrefillSession* peer_vision,
+                                              bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
-    if (tp2()) {
-        throw std::logic_error("multimodal prefill has no tensor-parallel path in this build");
-    }
     const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    const MultimodalPrefill multimodal{tokens, input.positions, &vision, peer_vision, begin,
+                                       input.rope_delta};
+    if (tp2()) {
+        NullTap tap;
+        return prefill_impl_multimodal_tp2(tokens.subspan(begin, nominal_length), multimodal, tap,
+                                           finalize_at_end);
+    }
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
+                        finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
+                                              std::uint32_t begin, std::uint32_t nominal_length,
+                                              VisionPrefillSession& vision,
+                                              VisionPrefillSession* peer_vision,
+                                              bool finalize_at_end, DFlashFeatureSink& sink) {
+    if (begin >= input.token_ids.size() || nominal_length == 0 ||
+        nominal_length > input.token_ids.size() - begin) {
+        throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
+    }
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, &vision, peer_vision, begin,
+                                       input.rope_delta};
+    if (tp2()) {
+        return prefill_impl_multimodal_tp2(tokens.subspan(begin, nominal_length), multimodal, sink,
+                                           finalize_at_end);
+    }
+    return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
                         finalize_at_end);
 }
 
@@ -2172,6 +2197,231 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             rewrite_checkpoint_hidden_output_ != nullptr) {
             require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16, {kCfg.hidden, 1},
                                  "rewrite checkpoint hidden output");
+            const Tensor checkpoint_hidden = xf[0].slice(1, len - 1, 1);
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(ctx_.device));
+            CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
+                                       checkpoint_hidden.data, checkpoint_hidden.bytes(),
+                                       cudaMemcpyDeviceToDevice, ctx_.stream));
+        }
+    }
+
+    if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+        work_.reset();
+        tp_->work->reset();
+        tap.consume_prefill_chunk(len, checkpoint_rel > 0 && len == checkpoint_rel);
+    }
+
+    if (checkpoint_rel > 0 && len == checkpoint_rel) {
+        for_each_rank(execution, [&](int rank) {
+            state_for(rank).copy_slot(linear_state_current_slot_,
+                                      linear_state_rewrite_checkpoint_slot_, stream_for(rank));
+        });
+    }
+
+    prefill_rewrite_checkpoint_frontier_ = -1;
+    synchronize_all();
+    work_.reset();
+    tp_->work->reset();
+    return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(len),
+                              .finalized        = finalize_at_end && len == T};
+}
+
+template <class Tap>
+PrefillChunkResult
+TextContext::prefill_impl_multimodal_tp2(std::span<const int> ids,
+                                         const MultimodalPrefill& multimodal, Tap& tap,
+                                         bool finalize_at_end) {
+    if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
+    if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("TextContext::prefill token count exceeds int32");
+    }
+    const ExecutionContext& execution       = ec();
+    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const int T                             = static_cast<int>(ids.size());
+    const int chunk                         = static_cast<int>(prefill_chunk_);
+    const std::uint32_t base                = text_kv_base_;
+
+    if (base != multimodal.begin ||
+        multimodal.token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
+        throw std::invalid_argument("multimodal prefill suffix does not match its cache base");
+    }
+    if (multimodal.positions.size() != 3 * multimodal.token_ids.size()) {
+        throw std::invalid_argument("multimodal positions must have shape [3,T]");
+    }
+    if (multimodal.vision == nullptr || multimodal.peer_vision == nullptr) {
+        throw std::invalid_argument(
+            "tensor-parallel multimodal prefill requires both Vision sessions");
+    }
+    if (mtp_enabled() && io_.mtp.has_value()) {
+        // MTP × vision × tp2 不在本路径范围（生产的投机后端是 DFlash2）：显式拒绝，不默默算错。
+        throw std::logic_error("tensor-parallel multimodal prefill does not support MTP yet");
+    }
+    rope_delta_ = multimodal.rope_delta;
+    for_each_rank(execution, [&](int rank) {
+        ops::set_i32_scalar(io_for(rank).rope_delta, rope_delta_, stream_for(rank));
+    });
+
+    if (static_cast<std::uint64_t>(text_kv_base_) + static_cast<std::uint64_t>(T) >
+        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
+    }
+    const int base_i              = static_cast<int>(text_kv_base_);
+    const std::int64_t base64     = static_cast<std::int64_t>(text_kv_base_);
+    const std::int64_t checkpoint_abs = prefill_rewrite_checkpoint_frontier_;
+    const bool has_rewrite_checkpoint =
+        checkpoint_abs > base64 && checkpoint_abs <= base64 + static_cast<std::int64_t>(T);
+    const int checkpoint_rel =
+        has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
+
+    int len = std::min(chunk, T);
+    if (checkpoint_rel > 0 && len > checkpoint_rel) { len = checkpoint_rel; }
+    work_.reset();
+    tp_->work->reset();
+
+    const std::uint32_t prompt_t0 = base;
+    // 两卡的会话各自独立编码（复制权重、各自落地）。块长由同一个 host 侧 plan 决定：
+    // rank 0 先定，rank 1 必须给出同一段，否则两边的前进步调会发散。
+    // kernel 启动进当前设备，而会话只在 tp1 假设下设置它 —— 这里显式按 rank 守卫。
+    VisionChunk vision_chunk;
+    {
+        const CurrentDevice restore;
+        CUDA_CHECK(cudaSetDevice(ctx_.device));
+        vision_chunk = multimodal.vision->prepare_chunk(prompt_t0, len);
+    }
+    len                      = vision_chunk.length;
+    VisionChunk peer_chunk;
+    {
+        const CurrentDevice restore;
+        CUDA_CHECK(cudaSetDevice(tp_->device->device));
+        peer_chunk = multimodal.peer_vision->prepare_chunk(prompt_t0, len);
+    }
+    if (peer_chunk.length != len || (peer_chunk.control == nullptr) != (vision_chunk.control == nullptr)) {
+        throw std::logic_error("tensor-parallel Vision chunking disagrees between ranks");
+    }
+
+    const bool is_last = finalize_at_end && len == T;
+    nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                  static_cast<std::uint64_t>(len));
+
+    // 媒体占位在本块内的局部下标（host 算一次，两卡共用同一份）。
+    std::vector<std::int32_t> local_scatter_indices;
+    std::int32_t visual_begin = 0;
+    if (vision_chunk.control != nullptr) {
+        const auto scatter = std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
+        const auto begin_it = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
+        const auto end_it   = std::lower_bound(begin_it, scatter.end(), prompt_t0 + len);
+        const auto count    = static_cast<std::int32_t>(end_it - begin_it);
+        visual_begin        = static_cast<std::int32_t>(begin_it - scatter.begin());
+        local_scatter_indices.resize(static_cast<std::size_t>(count));
+        for (std::int32_t i = 0; i < count; ++i) {
+            local_scatter_indices[static_cast<std::size_t>(i)] =
+                begin_it[i] - static_cast<std::int32_t>(prompt_t0);
+        }
+    }
+
+    {
+        auto scope_0 = work_.scope();
+        auto scope_1 = tp_->work->scope();
+        std::array<workspace_recipe::TextPrefillRoots, 2> roots;
+        std::array<Tensor, 2> ids_device;
+        std::array<Tensor, 2> positions;
+        std::array<Tensor, 2> rope_positions;
+        std::array<Tensor, 2> x;
+        std::array<Tensor, 2> staging;
+        for (std::size_t r = 0; r < 2; ++r) {
+            roots[r] = workspace_recipe::text_prefill_roots<TextConfig>(
+                *ws[r], len, 3, static_cast<std::int32_t>(local_scatter_indices.size()));
+            ids_device[r]     = roots[r].ids;
+            positions[r]      = roots[r].positions;
+            rope_positions[r] = roots[r].rope_positions;
+            x[r]              = roots[r].residual;
+            staging[r]        = ws[r]->alloc(DType::BF16, {kCfg.hidden, len});
+        }
+        // MROPE 三轴位置是 host 数据，两卡各拷一份（与 tp1 多变体路径同源）。
+        std::vector<std::int32_t> rope_positions_host(static_cast<std::size_t>(3) * len);
+        {
+            const std::size_t prompt_tokens = multimodal.token_ids.size();
+            for (int axis = 0; axis < 3; ++axis) {
+                const auto* src = multimodal.positions.data() +
+                                  static_cast<std::size_t>(axis) * prompt_tokens + prompt_t0;
+                std::copy_n(src, len,
+                            rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
+            }
+        }
+        for_each_rank(execution, [&](int rank) {
+            const auto r   = static_cast<std::size_t>(rank);
+            cudaStream_t s = stream_for(rank);
+            copy_i32(ids.data() + (prompt_t0 - base), ids_device[r], s);
+            ops::fill_i32_positions(positions[r], base_i, s);
+            copy_i32(rope_positions_host.data(), rope_positions[r], s);
+            ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_, x[r], s);
+        });
+        // 视觉特征在嵌入层整段覆写媒体占位：每卡 scatter 各自编码出的那份 embeddings。
+        if (!local_scatter_indices.empty()) {
+            const auto scatter_count = static_cast<std::int32_t>(local_scatter_indices.size());
+            for_each_rank(execution, [&](int rank) {
+                const auto r   = static_cast<std::size_t>(rank);
+                cudaStream_t s = stream_for(rank);
+                Tensor indices_device = roots[r].scatter_indices;
+                copy_i32(local_scatter_indices.data(), indices_device, s);
+                const Tensor& source = rank == 0 ? vision_chunk.embeddings : peer_chunk.embeddings;
+                Tensor embeddings    = source.slice(1, visual_begin, scatter_count);
+                ops::scatter(embeddings, indices_device, x[r], s);
+            });
+        }
+        if constexpr (Tap::enabled) { tap.begin(x[0]); }
+
+        ScopedValue<const Tensor*> peer_cache(peer_cache_positions_, &positions[1]);
+        ScopedValue<const Tensor*> peer_rope(peer_rope_positions_, &rope_positions[1]);
+        ScopedValue<const Tensor*> peer_rows(peer_kv_table_rows_, &tp_->io->text_kv_table_row);
+        ScopedPositions scoped_cache(active_cache_positions_, positions[0]);
+        ScopedPositions scoped_rope(active_rope_positions_, rope_positions[0]);
+        const auto visible = static_cast<std::uint32_t>(base_i + len);
+        const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
+        ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
+
+        run_layers_tp2(x, Phase::Prefill, staging, tap);
+        if constexpr (requires { tap.capture_positions(positions[0], stream_for(0)); }) {
+            tap.capture_positions(positions[0], stream_for(0));
+        }
+
+        std::array<Tensor, 2> xf;
+        xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
+                                                : ws[0]->alloc(DType::BF16, {kCfg.hidden, len});
+        xf[1] = tp_->prefill_hidden != nullptr && tp_->prefill_hidden->data != nullptr
+                    ? matrix_window(*tp_->prefill_hidden, len)
+                    : ws[1]->alloc(DType::BF16, {kCfg.hidden, len});
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps, true,
+                         xf[r], stream_for(rank));
+        });
+
+        if (is_last) {
+            const std::array<Tensor, 2> last = {xf[0].slice(1, len - 1, 1),
+                                                xf[1].slice(1, len - 1, 1)};
+            Tensor logits      = matrix_window(io_.logits, 1);
+            Tensor peer_logits = matrix_window(tp_->io->logits, 1);
+            logits_tp2(last, logits, peer_logits);
+            // Sampling belongs to rank 0 alone: it consumes the reconstructed FULL logits and
+            // writes the single committed token.
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(ctx_.device));
+            ops::set_i32_scalar(io_.pos, base_i + T, ctx_.stream);
+            ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, ctx_.stream);
+            if (sampling_config_ != nullptr) {
+                ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
+                            ops::kSamplePurposePrefill, work_, ctx_.stream);
+            } else {
+                ops::argmax(logits, io_.token, kCfg.token_domain, ctx_.stream);
+            }
+        }
+
+        if (checkpoint_rel > 0 && len == checkpoint_rel &&
+            rewrite_checkpoint_hidden_output_ != nullptr) {
+            require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
+                                 {kCfg.hidden, 1}, "rewrite checkpoint hidden output");
             const Tensor checkpoint_hidden = xf[0].slice(1, len - 1, 1);
             const CurrentDevice restore;
             CUDA_CHECK(cudaSetDevice(ctx_.device));

@@ -193,7 +193,11 @@ struct RequestControl {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
+        // tp2 下 rank 1 的视觉编码会话（各自编码各自落地，与引擎的复制计算范式一致）；tp1 为空。
+        std::unique_ptr<schedule::VisionPrefillSession> peer_vision;
         runtime::TransientRegion transient;
+        // tp2 下 rank 1 的请求 transient（peer_vision 的输出落地）；tp1 为空。
+        runtime::TransientRegion peer_transient;
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
@@ -259,7 +263,8 @@ public:
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
-                                                                runtime::TransientRegion transient);
+                                                                runtime::TransientRegion transient,
+                                                                runtime::TransientRegion peer_transient);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,

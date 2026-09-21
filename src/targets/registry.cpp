@@ -227,12 +227,32 @@ LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> s
 
 LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 
+namespace {
+
+// RequestMemory 的构造会把当前设备切到目标设备（arena 用 cudaMalloc 吃当前设备）且不恢复。
+// rank 1 的 transient 若直接在建构序列里建，会把当前设备留在 dev[1]，随后 program 创建的
+// rank 0 各 arena（KV/工作区/图）会错配到 dev[1] —— rank0 的 kernel 全部走 P2P 读，慢 ~30x。
+// 所以这里保存并恢复当前设备。
+std::unique_ptr<runtime::RequestMemory>
+make_peer_request_memory(ExecutionContext& execution, std::size_t capacity_bytes) {
+    if (execution.tp != 2 || capacity_bytes == 0) { return nullptr; }
+    int previous = 0;
+    (void)cudaGetDevice(&previous);
+    auto out = std::make_unique<runtime::RequestMemory>(*execution.dev[1], capacity_bytes);
+    (void)cudaSetDevice(previous);
+    return out;
+}
+
+} // namespace
+
 Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          ExecutionContext& execution)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
+      peer_request_memory(
+          make_peer_request_memory(execution, sequence_plan.request_transient_capacity_bytes())),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), execution)) {}
 
@@ -250,6 +270,8 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                ExecutionContext& execution)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
+      peer_request_memory(
+          make_peer_request_memory(execution, sequence_plan.request_transient_capacity_bytes())),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan),
                                              execution)) {}

@@ -36,6 +36,9 @@ struct Qwen3_6_27BInstance {
     std::unique_ptr<LoadedQwen3_6_27B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
     runtime::RequestMemory request_memory;
+    // tp2 下 rank 1 的请求 transient（视觉编码输出的落地缓冲；两卡各自编码需要各自的落地）。
+    // tp1 或视觉关闭时为空——capacity 为 0 时不占显存。
+    std::unique_ptr<runtime::RequestMemory> peer_request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_27B::Program> program;
 
@@ -66,6 +69,7 @@ struct Qwen3_6_35BA3BInstance {
     std::unique_ptr<LoadedQwen3_6_35BA3B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
     runtime::RequestMemory request_memory;
+    std::unique_ptr<runtime::RequestMemory> peer_request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_35BA3B::Program> program;
 

@@ -564,11 +564,16 @@ private:
     // per-request try blocks untouched, reach worker_loop, and still fail_all.
     //
     // The caller must not touch this request or lane again except to drop the slot.
+    void deactivate_transients() noexcept {
+        instance_.request_memory.deactivate();
+        if (instance_.peer_request_memory) { instance_.peer_request_memory->deactivate(); }
+    }
+
     void fail_request_scope(const std::shared_ptr<Request>& request, std::uint32_t lane,
                             std::exception_ptr error) {
         instance_.program->abort_lane(lane);
         if (prefill_lane_ && *prefill_lane_ == lane) {
-            instance_.request_memory.deactivate();
+            deactivate_transients();
             prefill_lane_.reset();
         }
         complete_error(request, std::move(error));
@@ -608,7 +613,7 @@ private:
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             instance_.program->abort_lane(lane);
             if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
+                deactivate_transients();
                 prefill_lane_.reset();
             }
             complete_cancelled(request);
@@ -700,7 +705,7 @@ private:
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
             if (prefill_lane_ && lane == *prefill_lane_) {
-                instance_.request_memory.deactivate();
+                deactivate_transients();
                 prefill_lane_.reset();
             }
             instance_.program->abort_lane(lane);
@@ -711,7 +716,7 @@ private:
         if (!step.complete) { return; }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
         if (prefill_lane_ && *request->lane == *prefill_lane_) {
-            instance_.request_memory.deactivate();
+            deactivate_transients();
             prefill_lane_.reset();
         }
         request->begin = step.summary;
@@ -889,16 +894,24 @@ private:
             invalidate_lane_plans(lane);
 
             TransientRegion transient;
+            TransientRegion peer_transient;
             if (needs_prefill) {
                 instance_.request_memory.activate(summary.transient_bytes,
                                                   summary.transient_alignment);
+                if (instance_.peer_request_memory) {
+                    // tp2 视觉：rank 1 的编码落地与 rank 0 等大同步激活。
+                    instance_.peer_request_memory->activate(summary.transient_bytes,
+                                                            summary.transient_alignment);
+                    peer_transient = instance_.peer_request_memory->region();
+                }
                 prefill_lane_ = lane;
                 transient     = instance_.request_memory.region();
             }
             publish_runtime_stats();
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
+                lane, std::move(request->prompt), std::move(selected_plan), transient,
+                peer_transient);
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
@@ -909,7 +922,7 @@ private:
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
             if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
+                deactivate_transients();
                 prefill_lane_.reset();
             }
             slots_[lane].reset();
@@ -1193,7 +1206,7 @@ private:
             pending_.clear();
         }
         if (prefill_lane_) {
-            instance_.request_memory.deactivate();
+            deactivate_transients();
             prefill_lane_.reset();
         }
         protection_.reset();

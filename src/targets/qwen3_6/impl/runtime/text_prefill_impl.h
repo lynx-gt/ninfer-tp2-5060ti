@@ -92,17 +92,24 @@ PrefillChunkResult prefill_text_chunk(
 
 PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         VisionPrefillSession& vision, VisionPrefillSession* peer_vision,
+                         std::uint32_t nominal_length,
                          std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
                          bool finalize_at_end) {
-    if (state.dflash != nullptr) {
-        throw std::logic_error("DFlash staged multimodal prefill is unavailable");
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) {
+        // 与 prefill_text_chunk 相同的 per-sequence MTP KV 窗口一致性检查。
+        tp->mtp_kv = state.mtp_kv_peer;
+        if (tp->mtp_kv.valid() != state.mtp_kv.valid()) {
+            throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+        }
     }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     tp ? &*tp : nullptr);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -110,11 +117,21 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
             : -1);
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
+    if (state.dflash != nullptr) {
+        DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, peer_vision,
+                                  finalize_at_end, sink);
+    }
+    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, peer_vision,
+                              finalize_at_end);
 }
 
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
+    if (state.execution.peer != nullptr) {
+        // MTP × vision × tp2 不在本路径范围（生产的投机后端是 DFlash2）。
+        throw std::logic_error("tensor-parallel multimodal MTP bridge is unavailable");
+    }
     if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
         bridge.position < 0 ||
         static_cast<std::uint32_t>(bridge.position) + 1 != state.text_kv_base) {

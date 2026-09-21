@@ -592,6 +592,16 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return ShardMapping{artifact::ShardAxis::Columns, std::move(shards)};
     };
 
+    // Vision tensors are REPLICATED at tp2: each rank runs the same ViT forward on its own
+    // device from the shared host payload -- the engine's established replicated-compute idiom
+    // (same as token embedding and the dflash conv/residual tails), so every rank needs the
+    // whole tower. ~0.3 GiB per device at this checkpoint family.
+    // 必须放在所有 ends() 后缀分支之前：vision/layers/N/attention/{qkv,output} 这类名字会
+    // 撞上文本 attention 的分片后缀，文本档的分片尺寸（5120 系）套到 ViT（1152 系）上必炸。
+    if (object.starts_with("vision/")) {
+        return {};
+    }
+
     // Replicated: full copy on every device (shards stays empty).
     //
     // `gdn/norm` stays here and that is VERIFIED, not inherited: its real bound shape is {128}
@@ -918,11 +928,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                     std::to_string(tp));
     }
     if (tp > 1) {
-        if (features.vision) {
-            // The vision tower is out of scope for TP2 and has no shard map, so reject here
-            // rather than silently replicating a 4.6 GB backbone onto both devices.
-            throw std::invalid_argument("qwen3_6_27b: vision is not supported with tp > 1");
-        }
+        // Vision at tp>1 is supported by replicating the tower on every rank (shard map above):
+        // each rank encodes media on its own device, so the forward path needs no cross-rank
+        // traffic for the vision stage.
         const TextConfig config{};
         binder.set_shard_resolver([config, tp](std::string_view name) {
             return shard_placement(name, tp, config);
@@ -1226,10 +1234,6 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     }
 
     if (plan.features.vision) {
-        if (tp != 1) {
-            throw std::invalid_argument(
-                "qwen3_6_27b: Vision has no tensor-parallel forward path yet");
-        }
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
