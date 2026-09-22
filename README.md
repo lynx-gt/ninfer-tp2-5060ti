@@ -163,7 +163,7 @@ NInfer currently requires:
 - 64-bit Linux;
 - two NVIDIA GeForce RTX 5060 Ti (16 GiB each), which is the platform this fork is built and
   measured on; the engine itself runs on any `sm_120a` device, one or two;
-- NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
+- NVIDIA driver support for CUDA 13.0 and the CUDA Toolkit 13.0 or newer;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
@@ -267,7 +267,7 @@ W4A4 artifact described under [The weights](#the-weights).
 ### Usage
 
 ```bash
-# both GPUs, K16V8 KV, a 253,952-token single slot, MTP3 with the optimized proposal head
+# both GPUs, k16i8 KV, a 253,952-token single slot, MTP3 with the optimized proposal head
 ./build/apps/ninfer-serve models/qwen3_8_27b_quasar_w4a4.ninfer \
   --tp 2 --devices 0,1 \
   --max-context 253952 --kv-capacity 253952 --prefill-chunk 1024 \
@@ -355,7 +355,8 @@ carry `usage.cache_read_input_tokens` (with `cache_creation_input_tokens` report
 - **Vision is `--tp 1` only.** The Vision encoder runs on the primary device against replicated
   weights and has no split path, so `--tp 2 --vision` is rejected at startup.
 - **DFlash is rejected at `--tp 2`.** It remains a 35B-A3B text-only backend, and that target has no
-  tensor-parallel path at all.
+  tensor-parallel path at all. (`--spec dflash2`, the 27B draft head, does run at `--tp 2` — it is the
+  `--spec dflash` backend of the 35B target that is rejected.)
 - **Peer access depends on the board.** Upstream measured `cudaDeviceCanAccessPeer` as 0 between two
   RTX 5090s and stages the collectives as host-staged copies over PCIe rather than direct peer
   copies; on the two RTX 5060 Ti cards this fork was measured on, it reports 1 in both directions.

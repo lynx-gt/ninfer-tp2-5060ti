@@ -240,7 +240,7 @@ GPQA-Diamond、ERQA、RealWorldQA，EvalScope 1.9.0、单样本）。注意那�
 - 64 位 Linux；
 - **两块** NVIDIA GeForce RTX 5060 Ti（每块 16 GiB）—— 本 fork 就在这个平台上构建与实测；引擎本身可以在
   任意 `sm_120a` 设备上跑，一块或两块都行；
-- NVIDIA 驱动支持 CUDA 13.1，且 CUDA Toolkit 为 13.1 或更新；
+- NVIDIA 驱动支持 CUDA 13.0，且 CUDA Toolkit 为 13.0 或更新；
 - CMake 3.28 或更新，以及支持 C++20 的 host 编译器；
 - `pkg-config`；
 - FFmpeg 开发库：`libavformat >= 60`、`libavcodec >= 60`、`libavutil >= 58`、`libswscale >= 7`；
@@ -314,7 +314,7 @@ build/apps/ninfer-serve
   批处理前向；
 - 没有大规模 / 抢占式连续批处理、没有优先级与 QoS 调度、没有 CPU/GPU offload、也不是分布式服务；
 - `--vision` 只在 `--tp 1` 下可用（视觉编码器没有分片路径，`--tp 2 --vision` 启动即拒）；`--spec dflash`
-  在 `--tp 2` 下同样被拒；
+  在 `--tp 2` 下同样被拒（`--spec dflash2` 是 27B 的草稿头，`--tp 2` 下可用；被拒的只是 35B 的 dflash 后端）；
 - **`k16i8` 单槽到不了 262144**：它的 BF16 key 每 token 要 26.2 KiB；
 - 前缀复用命中要求**续写同一个前缀**，不是"有公共前缀"：只共享一段更早的公共前缀、但不是引擎保留的那一段，
   不会命中。命中的 prefill 与冷启动可能在最后几位不同（见上一节）；
