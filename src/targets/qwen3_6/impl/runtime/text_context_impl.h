@@ -2254,9 +2254,14 @@ TextContext::prefill_impl_multimodal_tp2(std::span<const int> ids,
             "tensor-parallel multimodal prefill requires both Vision sessions");
     }
     if (mtp_enabled() && io_.mtp.has_value()) {
-        // MTP × vision × tp2 不在本路径范围（生产的投机后端是 DFlash2）：显式拒绝，不默默算错。
-        throw std::logic_error("tensor-parallel multimodal prefill does not support MTP yet");
+        // MTP × vision 在 tp2 上走本路径：组合好的 MTP 输入嵌入在本函数末尾按 tp2 的
+        // mtp_prefill_chunk_tp2 送下去（rank 0 拥有嵌入半，rank 1 用目标模型的 final hidden 半）。
+        // 唯一的例外是"复用一段视觉前缀"的桥（mtp_bridge_multimodal），那条仍是显式拒绝。
+        if (!tp_->io->mtp.has_value()) {
+            throw std::logic_error("tensor-parallel multimodal MTP prefill requires a peer MTP frame");
+        }
     }
+    const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     rope_delta_ = multimodal.rope_delta;
     for_each_rank(execution, [&](int rank) {
         ops::set_i32_scalar(io_for(rank).rope_delta, rope_delta_, stream_for(rank));
@@ -2429,6 +2434,104 @@ TextContext::prefill_impl_multimodal_tp2(std::span<const int> ids,
                                        checkpoint_hidden.data, checkpoint_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, ctx_.stream));
         }
+
+        // MTP 提示对齐（视觉版）：MTP 头吃的是 SHIFTED 的 token 流、对目标模型自己的 final
+        // hidden 算，所以它的输入嵌入必须带上目标已经替换过的图像列 —— 漏了这一步就是把占位符
+        // （而块工作区是复用的，占位列里还留着上一个请求的字节）喂给草稿头，于是每一个被接受的
+        // 草稿都把目标 KV 带脏。rank 0 拥有嵌入半、随后的 scatter 也落在 rank 0 的工作区；rank 1
+        // 只用它自己的 final hidden 半，不需要这份嵌入。
+        if (prepare_mtp_prompt) {
+            const auto alignment_tokens = static_cast<std::uint32_t>(multimodal.token_ids.size());
+            const qwen3_6::MtpAlignmentWindow mtp_window = qwen3_6::plan_mtp_alignment_window(
+                alignment_tokens, prompt_t0, static_cast<std::uint32_t>(len));
+            std::vector<int> mtp_ids_host(static_cast<std::size_t>(len));
+            const int prompt_columns =
+                len - static_cast<int>(mtp_window.final_column_uses_generated_token);
+            for (int j = 0; j < prompt_columns; ++j) {
+                mtp_ids_host[static_cast<std::size_t>(j)] =
+                    multimodal.token_ids[static_cast<std::size_t>(
+                                             mtp_window.shifted_embedding_begin) +
+                                         static_cast<std::size_t>(j)];
+            }
+            Tensor mtp_ids = ws[0]->alloc(DType::I32, {len});
+            Tensor mtp_input_embeddings;
+            {
+                auto scope_0 = work_.scope();
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(ctx_.device));
+                if (mtp_window.final_column_uses_generated_token) {
+                    int next_token = 0;
+                    CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                    CUDA_CHECK(cudaMemcpy(&next_token, io_.token.data, sizeof(next_token),
+                                          cudaMemcpyDeviceToHost));
+                    mtp_ids_host[static_cast<std::size_t>(len - 1)] = next_token;
+                }
+                copy_i32(mtp_ids_host.data(), mtp_ids, ctx_.stream);
+
+                mtp_input_embeddings = work_.alloc(DType::BF16, {kCfg.hidden, len});
+                ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, ctx_.stream);
+                if (vision_chunk.control != nullptr) {
+                    const qwen3_6::MtpVisualOverlap overlap = qwen3_6::shifted_visual_overlap(
+                        vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
+                    if (!overlap.empty()) {
+                        Tensor shifted_indices = workspace_recipe::visual_scatter_indices(
+                            work_, static_cast<std::int32_t>(overlap.size()));
+                        qwen3_6::detail::scatter_shifted_visual_embeddings(
+                            mtp_input_embeddings, vision_chunk.embeddings, overlap,
+                            shifted_indices, ctx_.stream);
+                    }
+                }
+            }
+            const Tensor* mtp_input_embeddings_ptr = &mtp_input_embeddings;
+            const std::array<Tensor, 2> ar_hidden = {io_.mtp->ar_hidden,
+                                                     tp_->io->mtp->ar_hidden};
+            const std::array<Tensor, 2> mtp_logits = {matrix_window(io_.logits, 1),
+                                                      matrix_window(tp_->io->logits, 1)};
+            if (is_last && mtp_proposal_extent_ != 0) {
+                if (mtp_proposal_extent_ >
+                    static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
+                    throw std::logic_error("MTP proposal extent exceeds the configured window");
+                }
+                Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
+                mtp_prefill_chunk_tp2(mtp_ids, xf, positions, positions, chunk_envelope,
+                                      /*final_chunk=*/true, &ar_hidden, &mtp_logits, &draft0,
+                                      mtp_input_embeddings_ptr);
+
+                const std::array<Tensor, 2> ar_position = {
+                    io_.mtp->position.slice(0, 0, 1), tp_->io->mtp->position.slice(0, 0, 1)};
+                for_each_rank(execution, [&](int rank) {
+                    const auto r = static_cast<std::size_t>(rank);
+                    ops::set_i32_scalar(const_cast<Tensor&>(ar_position[r]), base_i + T,
+                                        stream_for(rank));
+                });
+                for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
+                    auto ar_scope_0 = work_.scope();
+                    auto ar_scope_1 = tp_->work->scope();
+                    Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
+                    Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
+                    std::array<Tensor, 2> next_hidden;
+                    for (std::size_t r = 0; r < 2; ++r) {
+                        next_hidden[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
+                    }
+                    const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
+                    const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
+                    mtp_forward_ar_step(prev_token, ar_hidden, ar_position, ar_envelope,
+                                        next_hidden, mtp_logits, next_token);
+                    for_each_rank(execution, [&](int rank) {
+                        const auto r   = static_cast<std::size_t>(rank);
+                        cudaStream_t s = stream_for(rank);
+                        CUDA_CHECK(cudaMemcpyAsync(ar_hidden[r].data, next_hidden[r].data,
+                                                   ar_hidden[r].bytes(), cudaMemcpyDeviceToDevice,
+                                                   s));
+                        ops::increment_i32_scalar(const_cast<Tensor&>(ar_position[r]), s);
+                    });
+                }
+            } else {
+                mtp_prefill_chunk_tp2(mtp_ids, xf, positions, positions, chunk_envelope,
+                                      /*final_chunk=*/false, nullptr, nullptr, nullptr,
+                                      mtp_input_embeddings_ptr);
+            }
+        }
     }
 
     if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
@@ -2543,10 +2646,22 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
 
 void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                        std::array<Tensor, 2>& x, std::array<Tensor, 2>& ah,
-                                       const std::array<Tensor, 2>& staging) {
+                                       const std::array<Tensor, 2>& staging,
+                                       const Tensor* input_embeddings) {
     const ExecutionContext& execution       = ec();
     const std::array<WorkspaceArena*, 2> ws = workspaces();
     const int T                             = ids.ne[0] * ids.ne[1];
+    // 视觉预填传入的是一份已经组合好的 [hidden, T] 嵌入（文本嵌入 + 图像列已就地替换），rank 0
+    // 因此不能再按 ids 查一次表 —— 否则图像列会被占位符覆盖，而块工作区是复用的，那些列里还留着
+    // 上一个请求的字节，每一个被接受的草稿都会把目标 KV 带脏。
+    if (input_embeddings != nullptr) {
+        if (input_embeddings->dtype != DType::BF16 || input_embeddings->ne[0] != kCfg.hidden ||
+            !input_embeddings->is_contiguous() ||
+            input_embeddings->numel() != static_cast<std::int64_t>(kCfg.hidden) * T ||
+            input_embeddings->data == nullptr) {
+            throw std::logic_error("tensor-parallel MTP input embeddings shape mismatch");
+        }
+    }
     // The caller's hidden is [hidden, T] in the AR/bridge shapes and [hidden, width, batch] in the
     // decode-batch one, so the aggregate column count is what has to match -- comparing ne[1]
     // alone silently accepts a batch>1 frame and then reads only its first lane.
@@ -2563,7 +2678,8 @@ void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tenso
     // would reserve hidden*T BF16 per MTP call for nothing. The startup capacity query plans one
     // for both devices, which over-plans rank 1 rather than under-planning it.
     std::array<workspace_recipe::MtpStemRoots, 2> roots{
-        workspace_recipe::mtp_stem<TextConfig>(*ws[0], T, /*allocate_embedding=*/true,
+        workspace_recipe::mtp_stem<TextConfig>(*ws[0], T,
+                                               /*allocate_embedding=*/input_embeddings == nullptr,
                                                kTensorParallelWidth),
         workspace_recipe::mtp_stem<TextConfig>(*ws[1], T, /*allocate_embedding=*/false,
                                                kTensorParallelWidth)};
@@ -2583,8 +2699,11 @@ void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tenso
     for_each_rank(execution, [&](int rank) {
         cudaStream_t s = stream_for(rank);
         if (rank == 0) {
-            Tensor emb = roots[0].embedding;
-            ops::embedding(flat_ids, *embed_, emb, s);
+            // 视觉预填直接交进组合好的嵌入（文本嵌入 + 图像列已替换占位符），所以跳过 token 查表；
+            // fc 分片收缩的仍是同一份 NORMALIZED EMBEDDING 半。
+            Tensor emb = input_embeddings != nullptr ? input_embeddings->view({kCfg.hidden, T})
+                                                     : roots[0].embedding;
+            if (input_embeddings == nullptr) { ops::embedding(flat_ids, *embed_, emb, s); }
             ops::rmsnorm(emb, *mtp_weights_for(0).pre_fc_norm_embedding, kCfg.rms_eps, true,
                          const_cast<Tensor&>(fc_input[0]), s);
         } else {
@@ -3046,7 +3165,8 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
                                         ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                         const std::array<Tensor, 2>* final_hidden,
                                         const std::array<Tensor, 2>* logits,
-                                        Tensor* draft_token) {
+                                        Tensor* draft_token,
+                                        const Tensor* input_embeddings) {
     if (!mtp_kv_.valid() || !tp_->mtp_kv.valid()) {
         throw std::runtime_error("MTP prefill is not enabled");
     }
@@ -3091,8 +3211,7 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
         auto bulk_scope_1 = tp_->work->scope();
         std::array<Tensor, 2> x;
         std::array<Tensor, 2> ah;
-        mtp_forward_stem_tp2(ids, hidden, x, ah, staging);
-
+        mtp_forward_stem_tp2(ids, hidden, x, ah, staging, input_embeddings);
         std::array<Tensor, 2> k_flat;
         std::array<Tensor, 2> v_flat;
         for (std::size_t r = 0; r < 2; ++r) {

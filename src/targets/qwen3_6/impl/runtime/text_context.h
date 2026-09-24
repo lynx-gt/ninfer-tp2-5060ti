@@ -359,7 +359,8 @@ public:
                                const std::array<Tensor, 2>& rope_positions,
                                ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                const std::array<Tensor, 2>* final_hidden,
-                               const std::array<Tensor, 2>* logits, Tensor* draft_token);
+                               const std::array<Tensor, 2>* logits, Tensor* draft_token,
+                               const Tensor* input_embeddings = nullptr);
 private:
     void bind();
 
@@ -435,9 +436,13 @@ private:
     // call's reduces exactly as the text layer loop reuses its own.
     // `ids` is rank 0's alone: rank 0's fc shard contracts the NORMALIZED EMBEDDING half and
     // rank 1's the NORMALIZED HIDDEN half, so device 1 never embeds a token in the MTP stem.
+    // `input_embeddings` is the vision case: a composed [hidden, T] embedding whose image columns
+    // already replaced the placeholder positions, which rank 0 must normalize instead of looking
+    // the ids up again. Rank 1 consumes the target-hidden half and needs no copy.
     void mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                               std::array<Tensor, 2>& x, std::array<Tensor, 2>& ah,
-                              const std::array<Tensor, 2>& staging);
+                              const std::array<Tensor, 2>& staging,
+                              const Tensor* input_embeddings = nullptr);
     void mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& ah,
                               const std::array<Tensor, 2>& positions,
                               const std::array<Tensor, 2>& rope_positions,
