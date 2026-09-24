@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
 
@@ -111,6 +112,16 @@ struct KvCapacityResolution {
     std::size_t available_after_startup_bytes        = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
+};
+
+// 计划是"对着被展示时的 lane 状态"算出来的，真正开跑时才被消费，中间那段状态可能被移动过
+// （保留前缀被同一 lane 上另一个请求挤掉、辅助 checkpoint 被重建）。执行前的再校验失败因此是
+// 一个请求的过期，不是一个执行单元的故障：抛这个类型的每一处检查都跑在计划的序言里、任何设备
+// 动作之前。单独命名它，才不会让 `admit_planned_request` 把它交给 worker 循环的兜底 catch ——
+// 那条路会 fail_all 整个 executor，让之后每个调用者都付一次冷启动。
+class PlanValidationError : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
 };
 
 } // namespace ninfer::runtime

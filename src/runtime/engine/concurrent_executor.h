@@ -918,6 +918,23 @@ private:
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
+        } catch (const PlanValidationError& stale) {
+            // 计划是"对着被展示时的 lane 状态"算的，真正开跑时它可能已经过期（保留前缀被同一 lane
+            // 上另一个请求挤掉、辅助 checkpoint 被重建）。抛这个类型的每一处检查都跑在
+            // start_prefill_lane 的序言里、任何设备动作之前，所以爆炸半径恰好是一个请求：清掉 lane
+            // 与它的计划、把这个请求以错误收尾，然后继续服务。交给下面的兜底 catch 会 fail_all 整个
+            // executor，让之后每个调用者都付一次冷启动。
+            (void)stale;
+            if (prefill_lane_ && *prefill_lane_ == lane) {
+                deactivate_transients();
+                prefill_lane_.reset();
+            }
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+            clear_protection_if_head(request);
+            complete_error(request, std::current_exception());
+            publish_runtime_stats();
+            return AdmissionProgress::ControlProgress;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
@@ -1280,13 +1297,15 @@ private:
             } catch (...) {
                 // Engine scope only. Everything whose blast radius is a single request is caught
                 // and completed at its own site (fail_request_scope for output/publication,
-                // remove_pending_error for planning and admission-time refusals), so what reaches
-                // here is a failure of the shared execution unit -- a CUDA error, a Program state
-                // inconsistency, an exhausted device allocation, or a service-projection drawdown
-                // that the Program's licensing contradicts. admit_planned_request cleans its
-                // lane up and rethrows on purpose: its region is dominated by start_prefill_lane,
-                // a device execution unit. The Engine cannot keep serving after one of those:
-                // every in-flight and queued request fails and the worker stops.
+                // remove_pending_error for planning and admission-time refusals, and the
+                // PlanValidationError arm of admit_planned_request for a plan that went stale
+                // between planning and admission), so what reaches here is a failure of the shared
+                // execution unit -- a CUDA error, a Program state inconsistency, an exhausted device
+                // allocation, or a service-projection drawdown that the Program's licensing
+                // contradicts. admit_planned_request cleans its lane up and rethrows those on
+                // purpose: its region is dominated by start_prefill_lane, a device execution unit.
+                // The Engine cannot keep serving after one of those: every in-flight and queued
+                // request fails and the worker stops.
                 fail_all(std::current_exception());
                 return;
             }
