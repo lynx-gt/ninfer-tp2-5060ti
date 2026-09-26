@@ -3,7 +3,7 @@
 # NInfer
 
 > 跑在**两张消费级卡**上的 NInfer 张量并行版。在 **2× RTX 5060 Ti（每卡 16 GiB）** 上实测：一份 27B 模型
-> 常驻两块卡、**单槽 253,952 token 上下文**、三档 KV cache（`bf16` / `int8` / `k16i8`）、
+> 常驻两块卡、**单槽 253,952 token 上下文**、四档 KV cache（`bf16` / `int8` / `k16i8` / `int4`）、
 > MTP3 投机解码且前缀复用真正命中、`/health` 如实反映引擎可用性。
 
 NInfer 是从零写的 C++/CUDA 推理引擎，只支持**显式注册**的 Qwen 系列 checkpoint。它通过本地 CLI 或
@@ -18,7 +18,7 @@ OpenAI / Anthropic 兼容的 HTTP 接口处理文本、图像与视频输入；�
 > **双卡张量并行**（`--tp 2 --devices A,B`：把每卡权重与 KV 常驻减半；一个进程、一份模型、两块卡，
 > 不用 NVLink，也不是分布式服务）。
 >
-> **本 fork 又加了三项**：**KV cache 档位**（`--kv-dtype bf16|int8|k16i8`）、**在 `--tp 2` 下真正生效
+> **本 fork 又加了三项**：**KV cache 档位**（`--kv-dtype bf16|int8|k16i8|int4`）、**在 `--tp 2` 下真正生效
 > 的 MTP 前缀复用**、以及**如实反映引擎可用性的 `/health`**（配合 supervisord 自愈）。这三项的实测平台是
 > **2× RTX 5060 Ti（每卡 16 GiB）**。`--tp 1` 的贪心输出与 `feaf4dd` 逐字节一致
 > （见 [`tests/data/tp1-golden/`](tests/data/tp1-golden/MANIFEST.md)）；单卡行为、支持的 identity、产物格式
@@ -170,14 +170,15 @@ usage 计量），以及由 prompt 渲染的函数工具；`/health` 报告引�
 - `--tp 2` 必须显式给 `--devices A,B`，两块卡要同 compute capability；`--tp 1` 仍是默认；
 - `--kv-capacity` 必须 ≥ `--max-context`；要把某档顶到它的上限就得用**显式**容量（`auto` 会多留 512 MiB）；
 - 16 GiB 卡上 `--max-concurrency 1` 是算术：下一节的档位表就是单槽的成本，`k16i8` 在 253,952 上放不下第二槽；
-- `--spec dflash` 与 `--vision` 在 `--tp 2` 下启动即拒；MTP（`--spec mtp --draft-tokens 1..5`，可加
-  `--lm-head-draft`）在 `--tp 2` 下工作，**包括前缀复用**；
+  `int4` 是例外 —— 两槽各 262,144 放得下（见下）。
+- `--tp 2` 支持 `--spec mtp`（`--draft-tokens 1..5`，可加 `--lm-head-draft`）、`--spec dflash2` 与
+  `--vision`，**包括前缀复用**；纯 `--spec dflash` 后端不在这条线的 TP2 资格范围内；
 - `--rope yarn`（本线从上游继承的扩展位置路径）存在但本 fork 未使用：上限 253,952 低于原生 262,144，
   不需要位置缩放，也没有测过。
 
 **已知限制**（与 TP2 和本定版相关）：
 
-- 视觉只在 `--tp 1` 下可用（编码器没有分片路径，`--tp 2 --vision` 启动即拒）；
+- 视觉在 `--tp 2` 下可用（实测平台为两块 5060 Ti，配合 MTP3 与两槽各 262,144，含一次媒体轮的前缀复用命中）；
 - **P2P 取决于板子**：上游在两块 5090 上测得 `cudaDeviceCanAccessPeer` 为 0、集合通信遂走 PCIe 主机中转；
   本 fork 实测的两块 5060 Ti 上该值是**双向 1**。无论哪种，一个 decode token 是 128 次 reduce 加一次 logit
   all-gather，CUDA Graph 下整套集合通信相对每轮约 28 ms 的权重读取很小；
@@ -193,7 +194,8 @@ usage 计量），以及由 prompt 渲染的函数工具；`/health` 报告引�
 ## KV cache 档位与长上下文上限
 
 `--kv-dtype` 按 K/V 两侧分别选编码：`bf16`（不量化）、`int8`（每 64 维一个 fp16 scale）、
-`k16i8`（BF16 的 key + INT8 的 value，V 侧每 64 维一个 scale）。所有档位的 QK 计算都在 BF16 上做，
+`k16i8`（BF16 的 key + INT8 的 value，V 侧每 64 维一个 scale）、`int4`（对称 4 bit 码，一字节两值，
+每 64 维一个 fp16 scale，无旋转）。所有档位的 QK 计算都在 BF16 上做，
 档位只改变常驻占用与读回路径。早期还有两档 FP8（`fp8` = 两侧都是 e4m3，`k16v8` = BF16 的 key + e4m3
 的 value），**实测后删除**：同等每 token 成本下 INT8 的 V 侧接受率不差，而且不再需要把 e4m3 码在 shared
 memory 里展开成 BF16（这一步实测是更慢而不是更快：131k token decode `fp8` 21.0 tok/s、`k16i8` 25.6、
@@ -215,6 +217,12 @@ memory 里展开成 BF16（这一步实测是更慢而不是更快：131k token 
 
 长上下文（`k16i8`，单槽，253952）：在没有 prefill 的稳定段里 decode 基本不随上下文变化，只在 KV 读上随
 上下文退化（131k token 时每轮 KV 流约 5.7 GB，而每卡权重是 10.36 GiB）—— 各档正是从这里开始拉开差距。
+
+`int4` 的测量口径与上表不同，所以没有进表。它存的是对称 4 bit 码 —— 一字节两值，每 64 维一个 fp16
+scale，无旋转 —— 每 token、每 head、每侧 136 B，而 `int8` 是 264 B。正是这份砍半的占用让**两槽各
+262,144 token**（`--kv-capacity 524288 --max-concurrency 2`）能和 `--vision` + MTP3 一起塞进同样两块卡；
+实测两槽的前缀复用都能命中，媒体轮也能命中。同一批 prompt 对 `bf16` 参照的隐状态余弦为 4k 0.9596、
+21k 0.9783，argmax 一致 —— 也就是说 `int4` 买的是常驻容量而不是精度，当约束是窗口而不是每轮成本时选它。
 
 前缀复用命中时，日志会报 `cache=7872 reuse=restore_turn_checkpoint`，首 token 时间从 1788 ms 降到 71 ms。
 命中的 prefill 是从 checkpoint frontier 往后续算的，不走完整的 prefill chunk 网格，所以**命中与冷启动可能在
@@ -277,7 +285,7 @@ build/apps/ninfer-serve
 
 | | 本 fork | 上游 `master` |
 |---|---|---|
-| `--kv-dtype` | `bf16`、`int8`、**`k16i8`**（BF16 key + INT8 value） | `bf16`、`int8`、`fp8`、`nvfp4`、`k8v4` |
+| `--kv-dtype` | `bf16`、`int8`、**`k16i8`**（BF16 key + INT8 value）、**`int4`**（对称 4 bit + fp16 scale） | `bf16`、`int8`、`fp8`、`nvfp4`、`k8v4` |
 | 张量并行 | `--tp 2 --devices A,B`，已在 2× RTX 5060 Ti 上验证 | 单卡 |
 | `/health` | 反映引擎可用性，并在引擎挂掉时由 supervisor 拉起 | 反映引擎可用性 |
 
@@ -293,7 +301,7 @@ build/apps/ninfer-serve
 - 分块 prefill 与 CUDA Graph 解码；
 - 启动时固定规模的小并发服务，真批处理解码；
 - MTP 投机解码，草稿窗口 1–5；
-- KV cache 档位 `bf16`、`int8`（group-64）、`k16i8`（BF16 key + INT8 value）；
+- KV cache 档位 `bf16`、`int8`（group-64）、`k16i8`（BF16 key + INT8 value）、`int4`（对称 4 bit + fp16 scale）；
 - 模型与思考模式感知的官方采样默认值，以及显式的 greedy / temperature / top-k / top-p / min-p /
   presence、frequency penalty 覆盖；
 - 兼容前缀复用，含 `--tp 2` 下的 MTP，命中数报在 `usage.prompt_tokens_details.cached_tokens`（OpenAI）/
@@ -313,8 +321,8 @@ build/apps/ninfer-serve
 - 一个 Engine 持有一份常驻模型，启动时固定 1–8 个并发请求容量；decode-ready 的请求在轮边界被压缩进一次
   批处理前向；
 - 没有大规模 / 抢占式连续批处理、没有优先级与 QoS 调度、没有 CPU/GPU offload、也不是分布式服务；
-- `--vision` 只在 `--tp 1` 下可用（视觉编码器没有分片路径，`--tp 2 --vision` 启动即拒）；`--spec dflash`
-  在 `--tp 2` 下同样被拒（`--spec dflash2` 是 27B 的草稿头，`--tp 2` 下可用；被拒的只是 35B 的 dflash 后端）；
+- `--vision` 在 `--tp 2` 下可用（实测含媒体轮的前缀复用命中）；`--spec dflash`
+  在 `--tp 2` 下被拒（`--spec dflash2` 是 27B 的草稿头，`--tp 2` 下可用；被拒的只是 35B 的 dflash 后端）；
 - **`k16i8` 单槽到不了 262144**：它的 BF16 key 每 token 要 26.2 KiB；
 - 前缀复用命中要求**续写同一个前缀**，不是"有公共前缀"：只共享一段更早的公共前缀、但不是引擎保留的那一段，
   不会命中。命中的 prefill 与冷启动可能在最后几位不同（见上一节）；

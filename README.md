@@ -3,8 +3,8 @@
 **English** | [简体中文](README.zh-CN.md)
 
 > Tensor-parallel NInfer on two consumer cards. Qualified on **2× RTX 5060 Ti (16 GiB each)**: one
-> 27B model resident across both GPUs, a **253,952-token single-slot context**, five KV-cache tiers
-> (`bf16` / `int8` / `k16i8`), MTP3 speculative decoding with prefix reuse that actually
+> 27B model resident across both GPUs, a **253,952-token single-slot context**, four KV-cache tiers
+> (`bf16` / `int8` / `k16i8` / `int4`), MTP3 speculative decoding with prefix reuse that actually
 > hits, and a `/health` that reports engine availability.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints. It runs
@@ -19,7 +19,7 @@ measures is in the fork note.
 > [giocom/ninfer-3060X2](https://github.com/giocom/ninfer-3060X2)) and, on that base, adds **dual-GPU
 > tensor parallelism** (`--tp 2 --devices A,B`) to the 27B execution package: one resident model, one
 > process, two devices, no NVLink and no distributed serving, halving per-card weight and KV residency.
-> This fork further adds **KV-cache tiers** (`--kv-dtype bf16|int8|k16i8`), a **working MTP prefix
+> This fork further adds **KV-cache tiers** (`--kv-dtype bf16|int8|k16i8|int4`), a **working MTP prefix
 > reuse at `--tp 2`**, and a **truthful `/health`** with supervisor-driven self-heal; those three were
 > measured on **2× RTX 5060 Ti (16 GiB each)**. `--tp 1` output is byte-identical to `feaf4dd` on the
 > greedy cases in [`tests/data/tp1-golden/`](tests/data/tp1-golden/MANIFEST.md), and single-GPU
@@ -297,10 +297,11 @@ entirely inside the reasoning stream:
 - `--kv-capacity` must be at least `--max-context`. The explicit form is what fits a tier at its
   ceiling; `auto` also keeps a 512 MiB sizing headroom.
 - `--max-concurrency 1` is arithmetic on 16 GiB cards: the tier table below is what one slot costs,
-  and `k16i8` at 253,952 leaves no room for a second.
-- MTP speculative decoding (`--spec mtp --draft-tokens 1..5`, optionally `--lm-head-draft`) works at
-  `--tp 2`, including compatible-prefix reuse. `--spec dflash` and `--vision` are rejected at
-  `--tp 2`.
+  and `k16i8` at 253,952 leaves no room for a second. `int4` is the exception — two 262,144-token
+  slots fit (see below).
+- `--tp 2` supports `--spec mtp` (`--draft-tokens 1..5`, optionally `--lm-head-draft`), `--spec dflash2`
+  and `--vision`, including compatible-prefix reuse; the plain `--spec dflash` backend is not part of
+  this line's TP2 qualification.
 - `--rope yarn`, the extended-position path this line inherits from upstream, is available but unused
   here: this fork's ceiling is 253,952 tokens, below the registered native 262,144, so no rope
   scaling is needed and none is measured.
@@ -310,7 +311,8 @@ See the [CLI guide](docs/cli.md) and [HTTP serving](docs/serving.md) for the ful
 ### KV-cache tiers and long-context limits
 
 `--kv-dtype` selects the KV codec per side: `bf16` (no quantization), `int8` (per-64 fp16 scale),
-`k16i8` (BF16 keys + INT8 values, V scaled every 64 dims). All tiers compute QK in BF16; the codec
+`k16i8` (BF16 keys + INT8 values, V scaled every 64 dims), `int4` (symmetric 4-bit codes, two per
+byte, one fp16 scale per 64 dims, no rotation). All tiers compute QK in BF16; the codec
 only changes residency and read-back. The earlier FP8 KV tiers (`fp8` = e4m3 both sides, `k16v8` =
 BF16 keys + e4m3 values) were removed after measurement: at the same cost per token the INT8 V codec
 accepts at least as well and no longer needs the kernel to expand e4m3 codes into BF16 in shared
@@ -337,6 +339,15 @@ Long context (`k16i8`, 1 slot, 253952): decode stays flat in the prefill-free re
 with context only through the KV read (at 131k tokens the KV stream is ~5.7 GB per round against
 10.36 GiB of weights per card), which is why the tiers separate at long context.
 
+`int4` is measured on a different column set, so it is not in the table above. It stores symmetric
+4-bit codes — two per byte, one fp16 scale per 64 dimensions, no rotation — at 136 B per token, head
+and side, against `int8`'s 264 B. That halved footprint is what makes **two full 262,144-token slots**
+(`--kv-capacity 524288 --max-concurrency 2`) fit on the same pair of cards together with `--vision`
+and MTP3; compatible-prefix reuse was verified to hit on both slots, and on a media turn. Against a
+`bf16` reference on the same prompts the hidden-state cosine is 0.9596 at 4k and 0.9783 at 21k, with
+identical argmax, i.e. `int4` buys residency rather than accuracy — it is the tier to reach for when
+the window, not the per-round cost, is the constraint.
+
 
 Prefix reuse hits when the retained turn checkpoint covers the prompt: a repeated request reports
 `cache=7872 reuse=restore_turn_checkpoint` and its time-to-first-token drops from 1788 ms to 71 ms.
@@ -352,8 +363,8 @@ carry `usage.cache_read_input_tokens` (with `cache_creation_input_tokens` report
 
 ### Limitations
 
-- **Vision is `--tp 1` only.** The Vision encoder runs on the primary device against replicated
-  weights and has no split path, so `--tp 2 --vision` is rejected at startup.
+- **Vision runs at `--tp 2`.** It was verified on the two 5060 Ti cards with MTP3 and two
+  262,144-token slots, including a media turn whose prefix reuse hit.
 - **DFlash is rejected at `--tp 2`.** It remains a 35B-A3B text-only backend, and that target has no
   tensor-parallel path at all. (`--spec dflash2`, the 27B draft head, does run at `--tp 2` — it is the
   `--spec dflash` backend of the 35B target that is rejected.)
@@ -397,7 +408,8 @@ support:
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- KV cache tiers `bf16`, `int8` (group-64) and `k16i8` (BF16 keys + INT8 values);
+- KV cache tiers `bf16`, `int8` (group-64), `k16i8` (BF16 keys + INT8 values) and `int4` (symmetric
+  4-bit codes + fp16 scales);
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
 - compatible-prefix reuse, including MTP at `--tp 2`, with the hit count reported as
@@ -449,13 +461,13 @@ branch as ahead of *and* behind `Neroued:master` -- that is the state of this li
 
 | | this fork | upstream `master` |
 |---|---|---|
-| `--kv-dtype` | `bf16`, `int8`, **`k16i8`** (BF16 keys + INT8 values) | `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4` |
+| `--kv-dtype` | `bf16`, `int8`, **`k16i8`** (BF16 keys + INT8 values), **`int4`** (symmetric 4-bit + fp16 scales) | `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4` |
 | Tensor parallelism | `--tp 2 --devices A,B`, validated on 2× RTX 5060 Ti | single GPU |
 | `/health` | engine availability, plus a supervisor-driven restart when the engine dies | engine availability |
 
 If you want `nvfp4` / `k8v4` KV tiers or upstream's newest single-GPU scheduling work, use upstream.
-If you want tensor-parallel serving on two consumer cards with the `k16i8` tier and MTP prefix reuse
-that actually hits, this fork is the line to use.
+If you want tensor-parallel serving on two consumer cards with the `k16i8` or `int4` tier and MTP
+prefix reuse that actually hits, this fork is the line to use.
 
 ## Getting help
 
