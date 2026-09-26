@@ -71,6 +71,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     // 合并 tp2-master 时这个字面量被旧侧覆盖掉了（枚举值一直在，CLI 选不到档 ⇒ 定版用不了 k16i8）。
     if (value == "k16i8") { return KvCacheStorage::Bf16KeyInt8Value; }
+    if (value == "int4") { return KvCacheStorage::Int4Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -122,7 +123,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|k16i8] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--kv-dtype bf16|int8|k16i8|int4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "

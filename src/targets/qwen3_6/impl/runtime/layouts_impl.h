@@ -918,6 +918,7 @@ DType kv_cache_k_dtype(KvCacheStorage storage) {
     case KvCacheStorage::BFloat16: return DType::BF16;
     case KvCacheStorage::Int8Group64: return DType::I8;
     case KvCacheStorage::Bf16KeyInt8Value: return DType::BF16;
+    case KvCacheStorage::Int4Group64: return DType::U8;
     }
     throw std::invalid_argument("unknown kv cache storage");
 }
@@ -927,6 +928,7 @@ DType kv_cache_v_dtype(KvCacheStorage storage) {
     case KvCacheStorage::BFloat16: return DType::BF16;
     case KvCacheStorage::Int8Group64: return DType::I8;
     case KvCacheStorage::Bf16KeyInt8Value: return DType::I8;
+    case KvCacheStorage::Int4Group64: return DType::U8;
     }
     throw std::invalid_argument("unknown kv cache storage");
 }
@@ -936,6 +938,7 @@ std::int32_t kv_cache_k_quant_group(KvCacheStorage storage) {
     case KvCacheStorage::BFloat16: return 0;
     case KvCacheStorage::Int8Group64: return qwen3_6::kKvQuantGroup;
     case KvCacheStorage::Bf16KeyInt8Value: return 0;
+    case KvCacheStorage::Int4Group64: return qwen3_6::kKvQuantGroup;
     }
     throw std::invalid_argument("unknown kv cache storage");
 }
@@ -945,6 +948,7 @@ std::int32_t kv_cache_v_quant_group(KvCacheStorage storage) {
     case KvCacheStorage::BFloat16: return 0;
     case KvCacheStorage::Int8Group64: return qwen3_6::kKvQuantGroup;
     case KvCacheStorage::Bf16KeyInt8Value: return qwen3_6::kKvQuantGroup;
+    case KvCacheStorage::Int4Group64: return qwen3_6::kKvQuantGroup;
     }
     throw std::invalid_argument("unknown kv cache storage");
 }

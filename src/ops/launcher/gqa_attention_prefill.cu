@@ -25,7 +25,13 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     // Per-device once-guard: the opt-in is a per-device kernel property.
     // k16i8：K 侧 bf16（无 scale）+ V 侧 int8（每 64 维 1 个 scale）。
     const bool i8_value = cache.k_dtype == DType::BF16 && cache.v_dtype == DType::I8;
-    if (i8_value) {
+    // int4-g64 档：K/V 都是对称 int4 打包码 + fp16 scale（每 64 维 1 个），无旋转。
+    const bool int4 = cache.k_dtype == DType::U8;
+    if (int4) {
+        ensure_func_attr_per_device(
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
+    } else if (i8_value) {
         ensure_func_attr_per_device(
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
@@ -65,6 +71,20 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __half*>(cache.v_scale_pages.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
+    } else if (int4) {
+        // int4-g64 档：K/V 都是对称 int4 打包码 + fp16 scale（每 64 维 1 个），无旋转。
+        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
+                                  static_cast<unsigned>(Geometry::QHeads /
+                                                        kGqaPrefillHeadsPerCta), 1u);
+        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, false, true>
+            <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                reinterpret_cast<const __nv_bfloat16*>(cache_k.data),
+                reinterpret_cast<const __nv_bfloat16*>(cache_v.data),
+                static_cast<const __half*>(cache.k_scale_pages.data),
+                static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens);
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads /
@@ -86,6 +106,9 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
+    // int4 档下 A2 append（MTP 层的 KV、检查点物化、续写搬运）同样 K/V 都打包（无旋转），
+    // 与 prefill 的 fill 同一套算术。
+    const bool int4 = cache.k_dtype == DType::U8;
     if (cache.k_dtype == DType::I8) {
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;
@@ -139,6 +162,25 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
                                                static_cast<__nv_bfloat16*>(cache_v.data), nullptr,
                                                static_cast<__half*>(cache.v_scale_pages.data),
                                                tokens);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (int4) {
+        // int4-g64：K/V 同档打包（对称 int4 + fp16 scale，无旋转）。block 仍是 96/128
+        //（3/4 个 warp），量化全部在寄存器 + warp 归约里完成。
+        constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
+        constexpr int kFillVecElems    = 8;
+        const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
+                                         (kGqaPrefillHeadDim / kFillVecElems);
+        const int fill_grid =
+            static_cast<int>(div_up(kv_elements, static_cast<std::int64_t>(kBlock)));
+        gqa_attention_prefill_fill_bf16_kernel<Geometry, Metadata, false, true>
+            <<<fill_grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data), metadata,
+                reinterpret_cast<__nv_bfloat16*>(cache_k.data),
+                reinterpret_cast<__nv_bfloat16*>(cache_v.data),
+                static_cast<__half*>(cache.k_scale_pages.data),
+                static_cast<__half*>(cache.v_scale_pages.data), tokens);
         CUDA_CHECK(cudaGetLastError());
     } else {
         constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;

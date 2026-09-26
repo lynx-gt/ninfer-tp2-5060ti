@@ -19,12 +19,14 @@
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/kv_cache_int4_group64.cuh"
 
 namespace ninfer::ops {
 
 // k16i8 档：K 侧 bf16（2 B/元素、无 scale）+ V 侧 int8 code（每 64 维 1 个 fp16 scale）。
 // V 的 code 在这里解成 bf16 写进 smem，PV 的 MMA 与纯 bf16 路径完全一致。
-template <typename Geometry, typename Metadata, bool Int8Value = false>
+// Int4Cache：K/V 都是对称 int4 打包码 + 每 64 维 1 个 fp16 scale，无旋转。
+template <typename Geometry, typename Metadata, bool Int8Value = false, bool Int4Cache = false>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
@@ -56,9 +58,45 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
 
     const std::int64_t cache_off = paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
         physical_page, kv_head, position & kPagedKVPageMask, d);
-    store_vec(&cache_k[cache_off], k_value);
+    // int4 档的 cache_k 是 U8 码平面（128 B/token/head），这里按 bf16 步长直写会以 4 倍
+    // 步长涂鸦码平面并在大窗口（> 容量/4）时冲出 plane 尾、污染 arena 邻居。这档的 K 只由
+    // 下面的量化分支写，bf16 直写必须跳过。
+    if constexpr (!Int4Cache) { store_vec(&cache_k[cache_off], k_value); }
 
-    if constexpr (Int8Value) {
+    if constexpr (Int4Cache) {
+        // int4 档：K/V 同档量化，口径照 int8（8-lane 组内 xor 归约 absmax → fp16
+        // scale = absmax/7 → 倒数 → rint 对称钳位 ±7），码宽 4 bit、两值/字节、无旋转。
+        // 与 int8 分支相同的 warp 布局：一个 warp 覆盖一个 (kv_head, token) 的 32 个
+        // 8 元素 chunk，每 8 个 lane 共享一个 64 维组的 scale。
+        const int page_off = position & kPagedKVPageMask;
+        const int group    = d / kKVCacheInt4Group;
+        auto quantize_side = [&](const int4& value, std::uint8_t* codes, __half* scale_pages) {
+            const __nv_bfloat16* bf16 = reinterpret_cast<const __nv_bfloat16*>(&value);
+            float values[8];
+            float lane_absmax = 0.0f;
+#pragma unroll
+            for (int i = 0; i < VecElems; ++i) {
+                values[i]   = __bfloat162float(bf16[i]);
+                lane_absmax = fmaxf(lane_absmax, fabsf(values[i]));
+            }
+            lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(0xffffffffu, lane_absmax, 1));
+            lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(0xffffffffu, lane_absmax, 2));
+            lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(0xffffffffu, lane_absmax, 4));
+            const __half scale =
+                __float2half_rn(lane_absmax > 0.0f ? lane_absmax / kKVCacheInt4MaxCode : 0.0f);
+            const float s   = __half2float(scale);
+            const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+            store_vec(codes + kv_cache_int4_code_index<Geometry>(physical_page, kv_head, d,
+                                                                 page_off),
+                      kv_cache_int4_pack8(values, inv));
+            if ((lane & (kKVCacheInt4Group / VecElems - 1)) == 0) {
+                scale_pages[gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, group,
+                                                               page_off)] = scale;
+            }
+        };
+        quantize_side(k_value, reinterpret_cast<std::uint8_t*>(cache_k), k_scale_pages);
+        quantize_side(v_value, reinterpret_cast<std::uint8_t*>(cache_v), v_scale_pages);
+    } else if constexpr (Int8Value) {
         // V 侧 int8（k16i8）：每 64 维 1 个 fp16 scale。head_dim/8 == 32 个 8 元素 chunk
         // 连续排布 ⇒ 同一 warp 的 32 个 lane 正好覆盖一个 (kv_head, token) 向量的 32 个 chunk，
         // 而每 8 个 lane（= 一个 64 维 group）共享一个 scale ⇒ 先在 8-lane 内做三次 xor 归约。
@@ -130,6 +168,40 @@ __device__ __forceinline__ void gqa_prefill_stage_i8value(__nv_bfloat16* dst,
     }
 }
 
+// Stage one [Bc, D] K/V tile 的 int4 版本：cache 里是对称 int4 码（两值/字节，行 128 B）+
+// 每 64 维 1 个 fp16 scale（与 int8 档 scale 平面同形）。读 4 B 码（8 维）+ 2 B scale →
+// 解成 8 个 bf16 → 写进与本文件 bf16 路径完全相同的 swizzle 位置。同步读写（i8value 同款），
+// 无旋转；scale 索引直接复用 int8 的 gqa_kv_quant_scale_index。
+template <typename Geometry>
+__device__ __forceinline__ void gqa_prefill_stage_int4(__nv_bfloat16* dst,
+                                                       const std::uint8_t* cache_codes,
+                                                       const __half* scale_pages, int kv_head,
+                                                       int k0, int max_query_abs,
+                                                       int physical_page, int tid) {
+    constexpr int D         = kGqaPrefillHeadDim;
+    constexpr int Bc        = kGqaPrefillBc;
+    constexpr int Threads   = kGqaPrefillThreads;
+    constexpr int VecPerRow = D / 8; // 8 个 int4 码（4 B）== 8 维
+    const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    const std::uint8_t* cache_block = cache_codes + kv_cache_int4_code_index<Geometry>(
+                                                        physical_page, kv_head, 0,
+                                                        k0 & kPagedKVPageMask);
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+        const int key_l  = chunk >> 5;        // / VecPerRow (32)
+        const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
+        __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
+        const int key    = k0 + key_l;
+        if (full_tile || key <= max_query_abs) {
+            const __half scale = scale_pages[gqa_kv_quant_scale_index<Geometry>(
+                physical_page, kv_head, d / kKVCacheInt4Group, key & kPagedKVPageMask)];
+            store_vec(p, kv_cache_int4_dequant_x8_from(&cache_block[key_l * (D / 2) + d / 2],
+                                                       __half2float(scale)));
+        } else {
+            store_vec(p, make_int4(0, 0, 0, 0));
+        }
+    }
+}
+
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
 // swizzled smem buffer. Keys beyond max_query_abs (which the causal mask always
 // drops) are zeroed so the padded/uninitialized cache tail never feeds NaNs into
@@ -173,7 +245,7 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata, bool Int8Value = false>
+template <typename Geometry, typename Metadata, bool Int8Value = false, bool Int4Cache = false>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ cache_k,
@@ -320,7 +392,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    if constexpr (Int4Cache) {
+        gqa_prefill_stage_int4<Geometry>(k_s, reinterpret_cast<const std::uint8_t*>(cache_k),
+                                         k_scale_pages, kv_head, 0, max_query_abs, physical_page,
+                                         tid);
+    } else {
+        gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
+                                       tid);
+    }
 
     ninfer::ops::cp_commit();
 
@@ -335,7 +414,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        if constexpr (Int8Value) {
+        if constexpr (Int4Cache) {
+            gqa_prefill_stage_int4<Geometry>(v_s,
+                                             reinterpret_cast<const std::uint8_t*>(cache_v),
+                                             v_scale_pages, kv_head, k0, max_query_abs,
+                                             physical_page, tid);
+        } else if constexpr (Int8Value) {
             gqa_prefill_stage_i8value<Geometry>(v_s, reinterpret_cast<const std::int8_t*>(cache_v),
                                                 v_scale_pages, kv_head, k0, max_query_abs,
                                                 physical_page, tid);
@@ -497,8 +581,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                               physical_page, tid);
+            if constexpr (Int4Cache) {
+                gqa_prefill_stage_int4<Geometry>(
+                    k_s, reinterpret_cast<const std::uint8_t*>(cache_k), k_scale_pages, kv_head,
+                    (kb + 1) * Bc, max_query_abs, physical_page, tid);
+            } else {
+                gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+                                               physical_page, tid);
+            }
 
             ninfer::ops::cp_commit();
         }

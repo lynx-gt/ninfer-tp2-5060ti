@@ -12,12 +12,15 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/kernel/kv_cache_int4_group64.cuh"
 
 namespace ninfer::ops {
 
 // k16i8 档的 V 侧：int8 code + 每 64 维 1 个 fp16 scale（K 侧仍是 plain bf16）。
+// Int4Cache：K/V 都是对称 int4 打包码（128 B/行）+ fp16 scale（每 64 维 1 个，8 B/行），
+// 量化口径照 int8、无旋转。
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput, bool Int8Value = false>
+          typename CacheInput, bool Int8Value = false, bool Int4Cache = false>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
     __nv_bfloat16* cache_v, __half* k_scale_pages, __half* v_scale_pages,
@@ -49,8 +52,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // scales with the Op's visible-key domain. See kGqaDecodeSharedResidencyBytes.
     constexpr int MinBlocksPerSm = 2;
     constexpr int Bf16Bytes      = static_cast<int>(sizeof(__nv_bfloat16));
+    // int4 档：K/V 两侧的码（128 B/key）与 scale（8 B/key = 4 × fp16）staging 竞技场。
+    // 关档时按 0 计，不占 residency 预算。
+    constexpr int Int4CodeBytes   = Int4Cache ? 2 * Bc * kKVCacheInt4CodeBytes : 0;
+    constexpr int Int4ScaleBytes  = Int4Cache ? 2 * Bc * kKVCacheInt4Groups * 2 : 0;
     constexpr int SharedBytes = gqa_shared_align16(QkvRows * D * Bf16Bytes) +          // qkv_s
                                 gqa_shared_align16(Wc * 16 * Bc * Bf16Bytes) +         // p_s
+                                gqa_shared_align16(Int4CodeBytes + Int4ScaleBytes) +   // int4
                                 gqa_shared_align16(PageIds *
                                                    static_cast<int>(sizeof(std::int32_t)));
     static_assert(SharedBytes * MinBlocksPerSm <= kGqaDecodeSharedResidencyBytes,
@@ -61,6 +69,12 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
     __shared__ std::int32_t physical_pages_s[PageIds];
+    // int4 的码/scale staging 竞技场（预算已在上面 SharedBytes 里计入）。布局：K 行 [0,Bc)、
+    // V 行 [Bc,2Bc)；码行 128 B（cp.async<16> 落入），scale 行 8 B（同步 8 B 载入）。
+    __shared__ __align__(16) std::uint8_t
+        int4_code_s[Int4Cache ? 2 * Bc * kKVCacheInt4CodeBytes : 1];
+    __shared__ __align__(16) __half
+        int4_scale_s[Int4Cache ? 2 * Bc * kKVCacheInt4Groups : 1];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 
@@ -175,7 +189,40 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
-                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
+                // int4 档的 cache_k 是 U8 码平面（128 B/token/head），按 bf16 步长直写会
+                // 涂鸦码平面——该档的 K 只由量化分支写，bf16 直写必须跳过。
+                if constexpr (!Int4Cache) {
+                    store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
+                } else {
+                    // int4 的 K：8-lane 组内归约 absmax → fp16 scale（absmax/7）→ 4 bit 打包，
+                    // 口径与 int8 相同、无旋转。scale 由组内 lane 0 写（每 64 维 1 个）。
+                    const int4 k_new            = load_vec<int4>(&input.k[new_off]);
+                    const __nv_bfloat16* k_bf16 = reinterpret_cast<const __nv_bfloat16*>(&k_new);
+                    float k_values[8];
+                    float lane_absmax = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        k_values[i]  = __bfloat162float(k_bf16[i]);
+                        lane_absmax  = fmaxf(lane_absmax, fabsf(k_values[i]));
+                    }
+                    lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(FullMask, lane_absmax, 1));
+                    lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(FullMask, lane_absmax, 2));
+                    lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(FullMask, lane_absmax, 4));
+                    const __half k_scale =
+                        __float2half_rn(lane_absmax > 0.0f ? lane_absmax / kKVCacheInt4MaxCode
+                                                           : 0.0f);
+                    const float k_s   = __half2float(k_scale);
+                    const float k_inv = k_s > 0.0f ? 1.0f / k_s : 0.0f;
+                    auto* k_codes     = reinterpret_cast<std::uint8_t*>(cache_k);
+                    store_vec(k_codes + kv_cache_int4_code_index<Geometry>(
+                                            physical_page, kv_head, d, p_tok & kPagedKVPageMask),
+                              kv_cache_int4_pack8(k_values, k_inv));
+                    if ((lane & 7) == 0) {
+                        k_scale_pages[gqa_kv_quant_scale_index<Geometry>(
+                            physical_page, kv_head, d / kKVCacheInt4Group,
+                            p_tok & kPagedKVPageMask)] = k_scale;
+                    }
+                }
 
                 if constexpr (Int8Value) {
                     // V 侧 int8（k16i8）：每 64 维 1 个 fp16 scale。一个 warp 覆盖一个 token 的
@@ -206,6 +253,34 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                     if ((lane & 7) == 0) {
                         v_scale_pages[gqa_kv_quant_scale_index<Geometry>(
                             physical_page, kv_head, d / kGqaKvQuantGroup,
+                            p_tok & kPagedKVPageMask)] = v_scale;
+                    }
+                } else if constexpr (Int4Cache) {
+                    // int4 的 V：与 K 侧同一套（对称 int4 + 每 64 维 1 个 fp16 scale，无旋转）。
+                    const int4 v_new            = load_vec<int4>(&input.v[new_off]);
+                    const __nv_bfloat16* v_bf16 = reinterpret_cast<const __nv_bfloat16*>(&v_new);
+                    float v_values[8];
+                    float lane_absmax = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        v_values[i]  = __bfloat162float(v_bf16[i]);
+                        lane_absmax  = fmaxf(lane_absmax, fabsf(v_values[i]));
+                    }
+                    lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(FullMask, lane_absmax, 1));
+                    lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(FullMask, lane_absmax, 2));
+                    lane_absmax = fmaxf(lane_absmax, __shfl_xor_sync(FullMask, lane_absmax, 4));
+                    const __half v_scale =
+                        __float2half_rn(lane_absmax > 0.0f ? lane_absmax / kKVCacheInt4MaxCode
+                                                           : 0.0f);
+                    const float v_s   = __half2float(v_scale);
+                    const float v_inv = v_s > 0.0f ? 1.0f / v_s : 0.0f;
+                    auto* v_codes     = reinterpret_cast<std::uint8_t*>(cache_v);
+                    store_vec(v_codes + kv_cache_int4_code_index<Geometry>(
+                                            physical_page, kv_head, d, p_tok & kPagedKVPageMask),
+                              kv_cache_int4_pack8(v_values, v_inv));
+                    if ((lane & 7) == 0) {
+                        v_scale_pages[gqa_kv_quant_scale_index<Geometry>(
+                            physical_page, kv_head, d / kKVCacheInt4Group,
                             p_tok & kPagedKVPageMask)] = v_scale;
                     }
                 } else {
@@ -266,6 +341,62 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
+        // 每 kb 迭代 staging 一个 [Bc, D] 的 K/V tile：int4 档走码+scale 两阶段管线，
+        // 其余档直接 cp.async bf16/码。越界槽位一律清零。
+        if constexpr (Int4Cache) {
+            // int4：码走 cp.async<16>（每 key 每侧 128 B = 8 块）；
+            // scale 行只有 8 B（4 × fp16，行内连续、行间按 page_off 连续），用同步 8 B
+            // 载入（每侧 32 行、合计 512 B，远低于码面，不值得占 cp.async 流水线）。
+            // 历史与新 token 都从打包后的 cache 回读（融合 append 已把它们写进去了）。
+            // 无效行码与 scale 都清零：0 × 0 = 0，与 bf16 路径的尾部清零同效。
+            constexpr int CodeChunks = Bc * (kKVCacheInt4CodeBytes / 16); // 256
+            const auto* k_codes  = reinterpret_cast<const std::uint8_t*>(cache_k);
+            const auto* v_codes  = reinterpret_cast<const std::uint8_t*>(cache_v);
+            const auto* k_scales = reinterpret_cast<const __half*>(k_scale_pages);
+            const auto* v_scales = reinterpret_cast<const __half*>(v_scale_pages);
+            const int page_off0 = k0 & kPagedKVPageMask;
+            // tile 不跨页（Bc=32 对齐、页 64），整 tile 的码/scale 各自连续。
+            const std::int64_t kc_base =
+                paged_kv_element_offset<kKVCacheInt4CodeBytes, Geometry::KVHeads>(
+                    physical_page, kv_head, page_off0, 0);
+            const std::int64_t vc_base =
+                paged_kv_element_offset<kKVCacheInt4CodeBytes, Geometry::KVHeads>(
+                    physical_page, kv_head, page_off0, 0);
+            const std::int64_t ks_base =
+                gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, page_off0);
+            const std::int64_t vs_base =
+                gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, page_off0);
+#pragma unroll 1
+            for (int chunk = tid; chunk < 2 * CodeChunks; chunk += Threads) {
+                const bool v_side = chunk >= CodeChunks;
+                const int  c      = v_side ? chunk - CodeChunks : chunk;
+                const int  row    = c >> 3;
+                const int  seg    = c & 7;
+                const int  key    = k0 + row;
+                std::uint8_t* dst = (v_side ? int4_code_s + (Bc + row) * kKVCacheInt4CodeBytes
+                                            : int4_code_s + row * kKVCacheInt4CodeBytes) +
+                                    seg * 16;
+                if (key >= split_start && key < split_end) {
+                    const std::uint8_t* src =
+                        (v_side ? v_codes + vc_base : k_codes + kc_base) +
+                        row * kKVCacheInt4CodeBytes + seg * 16;
+                    ninfer::ops::cp_async<16>(dst, src);
+                } else {
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+                }
+            }
+            if (tid < 2 * Bc) {
+                const bool v_side = tid >= Bc;
+                const int  row    = v_side ? tid - Bc : tid;
+                const int  key    = k0 + row;
+                uint2      value  = make_uint2(0u, 0u);
+                if (key >= split_start && key < split_end) {
+                    value = load_vec<uint2>((v_side ? v_scales + vs_base : k_scales + ks_base) +
+                                            row * kKVCacheInt4Groups);
+                }
+                store_vec(int4_scale_s + (v_side ? Bc + row : row) * kKVCacheInt4Groups, value);
+            }
+        } else {
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #pragma unroll 1
@@ -318,9 +449,28 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 store_vec(v_dst, make_int4(0, 0, 0, 0));
             }
         }
+        }
         ninfer::ops::cp_commit();
         ninfer::ops::cp_wait<0>();
         __syncthreads();
+
+        if constexpr (Int4Cache) {
+            // 码/scale 已落地 smem：每 warp 一行解量化到 swizzled tile，然后才能进 mma。
+            // lane l 负责 dims [8l, 8l+8)，码 4 B/lane，fp16 scale 按 64 维组（l>>3）取。
+            const int d0    = lane * 8;
+            const int group = lane >> 3;
+            for (int row = warp; row < Bc; row += Wc) {
+                store_vec(&k_s[row * D + gqa_small_t_tc_swz(row, d0)],
+                          kv_cache_int4_dequant_x8_from(
+                              int4_code_s + row * kKVCacheInt4CodeBytes + lane * 4,
+                              __half2float(int4_scale_s[row * kKVCacheInt4Groups + group])));
+                store_vec(&v_s[row * D + gqa_small_t_tc_swz(row, d0)],
+                          kv_cache_int4_dequant_x8_from(
+                              int4_code_s + (Bc + row) * kKVCacheInt4CodeBytes + lane * 4,
+                              __half2float(int4_scale_s[(Bc + row) * kKVCacheInt4Groups + group])));
+            }
+            __syncthreads();
+        }
 
         float score[QKNt][4];
 #pragma unroll

@@ -75,7 +75,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) +
                                     ": unsupported per-side KV codec combination");
     }
-    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8) ||
+    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8 &&
+         cache.k_dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -84,6 +85,10 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     if (cache.k_dtype == DType::I8 && cache.k_quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    // int4-g64：U8 码平面（两值/字节，leading 按字节记 = head_dim/2）+ 每 64 维 1 个 fp16 scale。
+    if (cache.k_dtype == DType::U8 && cache.k_quant_group != kQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": U8 (int4) KV cache must use quant_group 64");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -101,9 +106,12 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.k_pages.dtype != k_code_dtype || cache.v_pages.dtype != v_code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    // int4-g64 的码平面 leading 按字节记：256 维 × 4 bit = 128 B。
+    const std::int32_t k_code_leading = cache.k_dtype == DType::U8 ? kHeadDim / 2 : kHeadDim;
+    const std::int32_t v_code_leading = cache.v_dtype == DType::U8 ? kHeadDim / 2 : kHeadDim;
+    require_shape(cache.k_pages, k_code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, v_code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -153,7 +161,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) +
                                     ": unsupported per-side KV codec combination");
     }
-    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8) ||
+    if ((cache.k_dtype != DType::BF16 && cache.k_dtype != DType::I8 &&
+         cache.k_dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -162,6 +171,10 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.k_dtype == DType::I8 && cache.k_quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    // int4-g64：U8 码平面（两值/字节，leading 按字节记 = head_dim/2）+ 每 64 维 1 个 fp16 scale。
+    if (cache.k_dtype == DType::U8 && cache.k_quant_group != kQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": U8 (int4) KV cache must use quant_group 64");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -180,9 +193,12 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     if (cache.k_pages.dtype != k_code_dtype || cache.v_pages.dtype != v_code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    // int4-g64 的码平面 leading 按字节记：256 维 × 4 bit = 128 B。
+    const std::int32_t k_code_leading = cache.k_dtype == DType::U8 ? kHeadDim / 2 : kHeadDim;
+    const std::int32_t v_code_leading = cache.v_dtype == DType::U8 ? kHeadDim / 2 : kHeadDim;
+    require_shape(cache.k_pages, k_code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, v_code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");

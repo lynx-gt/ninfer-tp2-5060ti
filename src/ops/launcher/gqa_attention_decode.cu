@@ -87,7 +87,7 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput, bool Int8Value = false>
+          typename CacheInput, bool Int8Value = false, bool Int4Cache = false>
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
@@ -98,14 +98,15 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     Tensor& cache_v = cache.v_pages;
     // bf16 kernel uses only static smem (no dynamic staging).
     // Int8Value=true：V 是 int8 code + 每 64 维 1 个 fp16 scale（k16i8），K 侧仍是 plain bf16。
+    // Int4Cache=true：K/V 都是对称 int4 code + 每 64 维 1 个 fp16 scale。
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                 Masked, CacheInput, Int8Value>
+                                                 Masked, CacheInput, Int8Value, Int4Cache>
         <<<grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
             static_cast<__nv_bfloat16*>(cache_v.data),
-            nullptr,
-            Int8Value ? static_cast<__half*>(cache.v_scale_pages.data) : nullptr,
+            Int4Cache ? static_cast<__half*>(cache.k_scale_pages.data) : nullptr,
+            (Int8Value || Int4Cache) ? static_cast<__half*>(cache.v_scale_pages.data) : nullptr,
             static_cast<const std::int32_t*>(cache.block_tables.data),
         invocation.valid_columns == nullptr
             ? nullptr
@@ -228,7 +229,8 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+                                     cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -254,7 +256,13 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.k_dtype == DType::I8) {                                                        \
+            if (cache.k_dtype == DType::U8) {                                                      \
+                /* int4-g64 档：K/V 都是对称 int4 打包码 + fp16 scale（每 64 维 1 个），无旋转 */     \
+                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked,            \
+                                       CacheInput, false, true>(                                   \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    partial_acc, partial_m, partial_l, stream);                                    \
+            } else if (cache.k_dtype == DType::I8) {                                               \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \

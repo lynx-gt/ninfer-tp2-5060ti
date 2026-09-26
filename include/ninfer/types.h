@@ -32,6 +32,11 @@ enum class KvCacheStorage : std::uint8_t {
     // fp8 的 KV 档位（kvfp8 / k16v8）已按实测删除：同条件下 int8 V 的接受率与
     // decode 吞吐都不劣于 E4M3，且不需要在 kernel 里把 code 展开成 bf16。
     Bf16KeyInt8Value,
+    // 本 fork 追加的第三档：K/V 都走 INT4-G64（每侧 int4 code 128 B + fp16 scale 8 B，
+    // 每 token 每 head 单侧 136 B）。编址形状与 int8 定版完全同构（token×head×64 维组、
+    // fp16 scale），只是码宽 8→4 bit、两值打包进一字节（低 nibble = 偶数维，二进制补码，
+    // 对称钳位 ±7）。无旋转：量化口径照 int8（组内 absmax 对称），读写直通。
+    Int4Group64,
 };
 
 enum class KvCapacityMode : std::uint8_t {

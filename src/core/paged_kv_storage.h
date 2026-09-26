@@ -79,6 +79,11 @@ struct PagedKVStorageLayout {
     case KvCacheStorage::Nvfp4Group16:
         if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 128, DType::U8, 16}); }
         break;
+    // int4-g64：码平面 U8 leading 128（两值/字节），scale 平面 FP16 leading 4 —— 与 int8
+    // 档的 scale 平面逐项同形，只是码平面 256 B → 128 B。
+    case KvCacheStorage::Int4Group64:
+        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 128, DType::FP16, 4}); }
+        break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
         if (head_dim == kD256KVCacheHeadDim) {
             return {storage,

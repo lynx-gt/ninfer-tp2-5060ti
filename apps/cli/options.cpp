@@ -101,6 +101,7 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     // 合并 tp2-master 时被旧侧覆盖丢掉过（枚举值一直在，CLI 选不到档）。
     if (text == "k16i8") { return KvCacheStorage::Bf16KeyInt8Value; }
+    if (text == "int4") { return KvCacheStorage::Int4Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -124,7 +125,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
            "       [--device N] [--tp 1|2] [--devices N,N]\n"
-           "       [--kv-dtype bf16|int8|k16i8] [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|k16i8|int4] [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"

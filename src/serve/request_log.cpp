@@ -96,6 +96,7 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     case ninfer::KvCacheStorage::BFloat16: return "bf16";
     case ninfer::KvCacheStorage::Int8Group64: return "int8-group64";
     case ninfer::KvCacheStorage::Bf16KeyInt8Value: return "k16i8";
+    case ninfer::KvCacheStorage::Int4Group64: return "int4-group64";
     }
     return "unknown";
 }

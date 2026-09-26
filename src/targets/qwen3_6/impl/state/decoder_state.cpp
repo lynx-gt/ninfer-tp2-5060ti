@@ -29,6 +29,15 @@ bool validate_kv_side(DType dtype, std::int32_t quant_group, std::int32_t head_d
         }
         return true;
     }
+    case DType::U8: {
+        // int4-g64：U8 码平面（两值/字节，leading 按字节记 = head_dim/2）+ 每 64 维 1 个
+        // fp16 scale（scale 平面与 int8 档同形）。
+        if (quant_group != kKvQuantGroup || head_dim % quant_group != 0 || head_dim % 2 != 0) {
+            throw std::invalid_argument(std::string("Paged KV ") + side +
+                                        " int4 code plane does not match its head dimension");
+        }
+        return true;
+    }
     default:
         throw std::invalid_argument(std::string("Paged KV ") + side + " dtype is unsupported");
     }
@@ -57,11 +66,14 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.table_rows            = table_rows;
     // 每层 plane 顺序固定 [K code, V code, K scale?, V scale?]：单侧档位（bf16 / int8）逐 plane
     // 与改造前完全一致；k16i8 = K bf16（无 scale）+ V int8（每 64 维 1 个 scale）。
+    // int4-g64：码平面 U8、leading 按字节记 = head_dim/2（两值/字节），scale 平面与 int8 同形。
+    const std::int32_t k_code_extent = k_dtype == DType::U8 ? head_dim / 2 : head_dim;
+    const std::int32_t v_code_extent = v_dtype == DType::U8 ? head_dim / 2 : head_dim;
     const std::size_t per_layer = 2ULL + (k_scaled ? 1ULL : 0ULL) + (v_scaled ? 1ULL : 0ULL);
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * per_layer);
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        pool_spec.planes.push_back({k_dtype, head_dim, kv_heads, 256});
-        pool_spec.planes.push_back({v_dtype, head_dim, kv_heads, 256});
+        pool_spec.planes.push_back({k_dtype, k_code_extent, kv_heads, 256});
+        pool_spec.planes.push_back({v_dtype, v_code_extent, kv_heads, 256});
         if (k_scaled) {
             pool_spec.planes.push_back({DType::FP16, head_dim / k_quant_group, kv_heads, 256});
         }
