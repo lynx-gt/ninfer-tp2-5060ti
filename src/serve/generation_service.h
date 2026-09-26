@@ -7,6 +7,7 @@
 #include "ninfer/engine.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
+#include "serve/tool_call_parser.h"
 
 #include <chrono>
 #include <cstddef>
@@ -50,6 +51,10 @@ struct GenerationOutcome {
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
+    // tool 标记存在但结构不可表示时，Serve 按原文返回；这里带着稳定分类供 request_done JSON
+    // 与运维告警使用（both 为默认值时即「正常终答」）。
+    bool tool_marker_seen                  = false;
+    ToolCallFallbackReason fallback_reason = ToolCallFallbackReason::None;
 };
 
 struct StreamSink {

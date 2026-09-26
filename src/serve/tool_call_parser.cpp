@@ -116,13 +116,26 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, To
     return true;
 }
 
-ParsedToolCallOutput fallback(const std::string& text) {
+ParsedToolCallOutput fallback(const std::string& text, bool marker_seen,
+                              ToolCallFallbackReason reason = ToolCallFallbackReason::None) {
     ParsedToolCallOutput out;
-    out.content = text;
+    out.content          = text;
+    out.tool_marker_seen = marker_seen;
+    out.fallback_reason  = reason;
     return out;
 }
 
 } // namespace
+
+const char* tool_call_fallback_reason_name(ToolCallFallbackReason reason) noexcept {
+    switch (reason) {
+    case ToolCallFallbackReason::None: return "none";
+    case ToolCallFallbackReason::UnterminatedToolCall: return "unterminated_tool_call";
+    case ToolCallFallbackReason::MalformedToolCall: return "malformed_tool_call";
+    case ToolCallFallbackReason::TrailingContent: return "trailing_content";
+    }
+    return "unknown";
+}
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length) {
@@ -130,29 +143,38 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     constexpr std::string_view kToolClose = "</tool_call>";
 
     const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
+    if (first == std::string::npos) { return fallback(text, /*marker_seen=*/false); }
 
     ParsedToolCallOutput out;
-    out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+    out.content          = rtrim_ascii(std::string_view(text).substr(0, first));
+    out.tool_marker_seen = true;
 
     std::size_t pos = first;
     while (pos < text.size()) {
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
+        if (!starts_with_at(text, pos, kToolOpen)) {
+            return fallback(text, /*marker_seen=*/true, ToolCallFallbackReason::TrailingContent);
+        }
         const std::size_t inner_begin = pos + kToolOpen.size();
         const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
+        if (close == std::string::npos) {
+            return fallback(text, /*marker_seen=*/true,
+                            ToolCallFallbackReason::UnterminatedToolCall);
+        }
         ToolCall call;
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
                                  max_tool_name_length, call)) {
-            return fallback(text);
+            return fallback(text, /*marker_seen=*/true,
+                            ToolCallFallbackReason::MalformedToolCall);
         }
         out.tool_calls.push_back(std::move(call));
         pos = close + kToolClose.size();
     }
 
-    if (out.tool_calls.empty()) { return fallback(text); }
+    if (out.tool_calls.empty()) {
+        return fallback(text, /*marker_seen=*/true, ToolCallFallbackReason::MalformedToolCall);
+    }
     out.is_tool_call_response = true;
     return out;
 }

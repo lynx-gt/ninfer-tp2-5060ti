@@ -1,5 +1,6 @@
 #include "serve/console_log.h"
 #include "serve/request_log.h"
+#include "serve/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
 
@@ -339,6 +340,56 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    // 正常终答：没有 tool 标记，诊断是「无」。客户端据此把这一轮当普通回答处理。
+    failures += check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
+                          done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
+                      "plain answer must report an empty tool-call parse diagnostic");
+
+    // 模型输出了 tool 标记但结构不可表示时，Serve 按原文返回（finish_reason 仍 stop）；
+    // 这里的分类是客户端唯一能拿到的机器可读区分点，所以分类本身也要被驱动验证。
+    const std::string malformed_tool_markup =
+        "<tool_call>\n<function=write>\n<parameter=content>\nexport const example = true;\n"
+        "</parameter>\n<parameter=path>\n/tmp/example.ts\n</parameter>\n</function>\n";
+    const ParsedToolCallOutput malformed =
+        parse_qwen_tool_call_output(malformed_tool_markup, 64);
+    failures += check(!malformed.is_tool_call_response && malformed.tool_marker_seen &&
+                          malformed.fallback_reason ==
+                              ToolCallFallbackReason::UnterminatedToolCall &&
+                          malformed.content == malformed_tool_markup,
+                      "unterminated tool marker must fall back to text with its classification");
+    const std::string trailing_content_markup =
+        "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/a.ts\n</parameter>\n</function>\n"
+        "</tool_call>\nand then some prose";
+    failures +=
+        check(parse_qwen_tool_call_output(trailing_content_markup, 64).fallback_reason ==
+                  ToolCallFallbackReason::TrailingContent,
+              "content after a complete call must classify as trailing_content");
+    const std::string broken_function_markup =
+        "<tool_call>\n<function=>\n</function>\n</tool_call>";
+    failures +=
+        check(parse_qwen_tool_call_output(broken_function_markup, 64).fallback_reason ==
+                  ToolCallFallbackReason::MalformedToolCall,
+              "unrepresentable call body must classify as malformed_tool_call");
+    failures += check(parse_qwen_tool_call_output("no markup here", 64).fallback_reason ==
+                          ToolCallFallbackReason::None,
+                      "text without a marker must not carry a fallback classification");
+
+    GenerationOutcome malformed_outcome = outcome;
+    malformed_outcome.tool_marker_seen  = true;
+    malformed_outcome.fallback_reason   = ToolCallFallbackReason::UnterminatedToolCall;
+    malformed_outcome.finish_reason     = ninfer::FinishReason::StopToken;
+    const Json malformed_done =
+        Json::parse(format_request_done_json("serve-test", 3002, context, malformed_outcome));
+    failures += check(malformed_done.at("result").at("finish_reason") == "stop_token" &&
+                          malformed_done.at("result").at("tool_call_count") == 0 &&
+                          malformed_done.at("result").at("tool_call_parse").at("marker_seen") ==
+                              true &&
+                          malformed_done.at("result").at("tool_call_parse").at("fallback_reason") ==
+                              "unterminated_tool_call",
+                      "malformed tool markup must stay a stop_token outcome with a machine-readable "
+                      "classification");
+    failures += check(malformed_done.dump().find("export const example") == std::string::npos,
+                      "request log leaked generated tool markup");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

@@ -391,7 +391,11 @@ Function arguments use `response.function_call_arguments.delta` and `.done`. IDs
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+Malformed tool markup is flushed back as ordinary text without losing bytes; the turn keeps the
+model's own finish reason and no `tool_calls`. Serve warns once per affected request with only the
+stable classification, and `request_done.result.tool_call_parse` carries the same classification
+machine-readably (see Request log above), so a client can distinguish an intended-but-invalid call
+from a normal answer without parsing the markup itself.
 
 ### Local response state and resources
 
@@ -582,7 +586,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine including tensor-parallel width `tp` and the resolved per-rank `devices` list, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostic, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
@@ -594,6 +598,13 @@ memory rows remain a console load-summary table rather than structured-log field
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+
+`request_done.result.tool_call_parse` reports whether the model emitted tool markup that could not be
+returned as a structured call: `marker_seen` is true when the generated text contained `<tool_call>`,
+and `fallback_reason` is one of `none`, `unterminated_tool_call`, `malformed_tool_call`, or
+`trailing_content`. It is the machine-readable counterpart of the Serve warning below, carries no
+generated markup, and does not change the response: such a turn still finishes with the model's own
+finish reason and zero `tool_calls`.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators

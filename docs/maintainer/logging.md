@@ -158,7 +158,10 @@ not create a second request JSONL terminal.
 Tool-call parameter normalization remains a successful request outcome. Empty-argument omissions
 and schema mismatches are machine-only counters. If a complete tool marker must be returned to text
 because its structure or declared identity cannot be represented, Serve emits one warning carrying
-only the stable fallback classification; generated markup and arguments remain excluded.
+only the stable fallback classification; generated markup and arguments remain excluded. That same
+classification is machine-readable in `request_done.result.tool_call_parse`
+(`marker_seen`, `fallback_reason`), and the request outcome is unchanged: the model's own finish
+reason with zero `tool_calls`.
 
 There is no dual spdlog/custom operational path. Product results, machine measurements, and the
 explicit emergency cases above remain direct outputs because they are different contracts.

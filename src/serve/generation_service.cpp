@@ -412,6 +412,17 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+        outcome.tool_marker_seen = parsed.tool_marker_seen;
+        outcome.fallback_reason  = parsed.fallback_reason;
+        if (parsed.tool_marker_seen &&
+            parsed.fallback_reason != ToolCallFallbackReason::None) {
+            // 文档化行为（docs/maintainer/logging.md §6）：结构不可表示的完整 tool 标记按原文
+            // 返回时，Serve 只发出这一条 Warning，且只带稳定分类，不带 markup 与参数内容。
+            write_console_log(
+                ConsoleLogLevel::Warning,
+                std::string("tool markup returned as text | fallback=") +
+                    tool_call_fallback_reason_name(parsed.fallback_reason));
+        }
     }
     if (output_sink) {
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);

@@ -1,6 +1,7 @@
 #include "serve/request_log.h"
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
+#include "serve/tool_call_parser.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -575,7 +576,13 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
-             {"tool_call_count", outcome.tool_calls.size()}};
+             {"tool_call_count", outcome.tool_calls.size()},
+             // 模型输出过 tool 标记但结构不可表示时（按原文返回、finish_reason 仍 stop），
+             // 这里给出稳定分类，客户端可据此区分「想调工具但语法坏了」与「正常终答」。
+             {"tool_call_parse",
+              Json{{"marker_seen", outcome.tool_marker_seen},
+                   {"fallback_reason",
+                    tool_call_fallback_reason_name(outcome.fallback_reason)}}}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
